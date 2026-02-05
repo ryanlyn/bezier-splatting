@@ -9,6 +9,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from .area import closed_curve_enclosed_area
 from .model import VectorGraphicsScene
 
 
@@ -136,9 +137,8 @@ def scene_to_svg(scene: VectorGraphicsScene, H: int | None = None, W: int | None
                 continue
             bcp = scene.closed_boundary_cp[i]
             bcp_px = bcp.detach().cpu() * scale
-            cp_flat = bcp_px.reshape(-1, 2)
-            bb = cp_flat.max(dim=0).values - cp_flat.min(dim=0).values
-            area = (bb[0] * bb[1]).item()
+            # True enclosed area (not bounding box)
+            area = closed_curve_enclosed_area(bcp_px.unsqueeze(0))[0].item()
             svg_elem = _closed_curve_to_path(bcp, scene.closed_colors[i], opacity, H, W)
             elements.append((area, svg_elem))
 

@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from .area import closed_curve_enclosed_area
 from .model import VectorGraphicsScene
 
 
@@ -291,12 +292,10 @@ def _prune_and_densify(
     if scene.n_closed > 0:
         closed_opacities = torch.sigmoid(scene.closed_opacities)  # (N,)
 
-        # Area proxy: bounding box in pixel space
+        # True enclosed area in pixel space
         bcp = scene.closed_boundary_cp  # (N, 2, num_cp, 2) in [0,1]
         bcp_px = bcp * torch.tensor([W, H], device=device, dtype=bcp.dtype)
-        cp_flat = bcp_px.reshape(bcp_px.shape[0], -1, 2)
-        bb_size = cp_flat.max(dim=1).values - cp_flat.min(dim=1).values
-        areas = bb_size[:, 0] * bb_size[:, 1]
+        areas = closed_curve_enclosed_area(bcp_px)
 
         keep_mask = (closed_opacities > opacity_threshold) & (areas > 4.0)
         pruned_closed = (~keep_mask).sum().item()
