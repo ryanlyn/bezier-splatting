@@ -1,0 +1,23 @@
+[project]
+name = "bezier-splatting"
+version = "0.1.0"
+description = "Differentiable vector graphics rendering via Bézier splatting (NeurIPS 2025)"
+readme = "README.md"
+authors = [
+    { name = "ryanlyn", email = "mailboxryanlin@icloud.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "marimo>=0.19.7",
+    "pillow>=12.1.0",
+    "torch>=2.10.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.23,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
