@@ -1,0 +1,14 @@
+\vspace{-.5em}
+\section{Conclusion}
+\vspace{-.5em}
+
+This work has presented Bézier Splatting, a novel differentiable vector graphics (VGs) representation that leverages Gaussian splatting for efficient Bézier curve optimization. Our method achieves 30$\times$ faster forward computation and 150$\times$ faster backward computation in rasterization compared to existing methods, while also delivering high rendering fidelity. Additionally, our adaptive pruning and densification strategy improves optimization by dynamically adjusting curve placement during optimization. Extensive experiments have demonstrated that Bézier Splatting outperforms existing differentiable VG methods in both training efficiency and visual quality, making it a promising solution for scalable applications of VGs. 
+
+\noindent\textbf{Limitation and future work.}
+The closed curves in Bézier Splatting are enforced to have convex shapes using Xing loss \cite{xu2022live} to prevent false interpolation results, which may slightly reduce the capacity of VG representations. Additionally, the closed curves require sampling more Gaussian points to represent area boundaries precisely, leading to slower computation compared to open curves.
+An interesting future direction is to leverage the efficiency and differentiability of our approach for high-quality VG synthesis applications such as text-to-VG generation or text-guided VG editing.
+
+\section{Acknowledgement}
+This work was supported in part by the National Science Foundation (NSF) and SC EPSCoR Program under award number 
+\#OIA-2242812.
+This research used in part resources on the Palmetto Cluster at Clemson University under NSF awards MRI 1228312, II NEW 1405767, MRI 1725573, and MRI 2018069. The views expressed in this article do not necessarily represent the views of NSF or the United States government. The authors also thank Dr. Yiqi Zhong and Dr. Luming Liang  for beneficial discussions.

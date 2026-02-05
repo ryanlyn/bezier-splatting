@@ -1,0 +1,40 @@
+% \begin{table}[t]
+% \centering
+% \caption{Forward and backward speed of DiffVG \cite{Li:2020:DVG} and Bézier splatting (tested on a 2,040$\times$1,344 image, using 2,048 curves).}
+% \vspace{-1em}
+% \resizebox{0.95\linewidth}{!}{%
+% \begin{tabular}{ll|ccc}
+% \hline
+%  & & DiffVG & Bézier splatting & Speedup \\
+% \hline
+% \multirow{2}{*}{Open} & Forward & 141.3ms  & \textbf{7.2ms} & 19.6$\times$ \\  
+% & Backward & 701.3.ms & \textbf{4.7ms} & 149.2$\times$ \\  
+% \hline
+% \multirow{2}{*}{Closed} & Forward & 85.2ms  & \textbf{14.2ms} & 6.0$\times$ \\  
+% & Backward & 448.3ms  & \textbf{15.7ms} & 28.5$\times$ \\  
+% \hline
+% \end{tabular}
+% }
+% \label{tab:speed_comparison}
+% \vspace{-.5em}
+% \end{table}
+
+\begin{table}[t]
+\centering
+\caption{Computational speed for rendering a 2,040$\times$1,344 image with 2,048 curves.}
+\vspace{-.7em}
+\resizebox{0.83\linewidth}{!}{%
+\begin{tabular}{l|ccc|ccc}
+\hline
+& \multicolumn{3}{c|}{\textbf{Open curve}} & \multicolumn{3}{c}{\textbf{Closed curve}} \\
+& DiffVG \cite{Li:2020:DVG} & Bézier Splatting & Speedup & DiffVG \cite{Li:2020:DVG} & Bézier Splatting & Speedup \\
+\hline
+Forward pass & 141.3ms & \textbf{4.5ms} & \textit{31.4}$\times$ & 85.2ms & \textbf{14.1ms} & \textit{6.0}$\times$ \\
+Backward pass & 701.3ms & \textbf{4.7ms} & \textit{149.2}$\times$ & 448.3ms & \textbf{24.58ms} & \textit{18.2}$\times$ \\
+\hline
+\end{tabular}
+}
+\label{tab:speed_comparison}
+% \vspace{-.5em}
+\end{table}
+

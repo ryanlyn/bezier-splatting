@@ -1,0 +1,94 @@
+% \begin{table*}[!h]
+%     \centering
+    
+%     \caption{
+%          A quantitative evaluation on the Kodak dataset \cite{kodak1999} (256 to 2,048 open curves).
+%     }
+%     % \vspace{-1em}
+%     \resizebox{1\textwidth}{!}{
+%         \begin{tabular}{l|ccc|ccc|ccc|ccc}
+%             \toprule
+%              \multirow{2}{*} {\textbf{Method} 
+%              % / \textbf{Curve \#} 
+%              } & \multicolumn{3}{c|}{\textbf{256}} & \multicolumn{3}{c|}{\textbf{512}} & \multicolumn{3}{c|}{\textbf{1024}} & \multicolumn{3}{c}{\textbf{2048}} \\
+                        
+%              & $SSIM^\uparrow$   & $PSNR^\uparrow$    & $LPIPS^\downarrow$ & $SSIM^\uparrow$   & $PSNR^\uparrow$    & $LPIPS^\downarrow$ & $SSIM^\uparrow$   & $PSNR^\uparrow$    & $LPIPS^\downarrow$ & $SSIM^\uparrow$   & $PSNR^\uparrow$    & $LPIPS^\downarrow$   \\
+%             \hline
+            
+%             \multirow{2}{*}{Open} 
+%              DiffVG & 0.601 & 23.43 & 0.535  & 0.645 & 24.70 & 0.495  & 0.699 & 26.04 & 0.439  & 0.762 & 27.56 & 0.360  \\
+%             Ours & \textbf{0.679} & \textbf{26.18} & \textbf{0.457}  & \textbf{0.743} & \textbf{27.90} & \textbf{0.383}  & \textbf{0.797} & \textbf{29.24} & \textbf{0.310}  & \textbf{0.793} & \textbf{28.75} & \textbf{0.300}  \\
+            
+%             \hline
+%             \multirow{3}{*}{Closed} 
+%             & DiffVG & 0.622 & 24.11 & 0.513  & 0.666 & 25.34 & 0.475  & 0.719 & 26.66 & 0.420  & 0.779 & 28.17 & 0.350  \\
+%             & LIVE  & \textbf{0.647} & \textbf{24.61} & \textbf{0.495}  & \textbf{0.693} & \textbf{26.00} & \textbf{0.447}  & \textbf{0.742} & \textbf{27.47} & \textbf{0.392} & - & - & -  \\
+%             & \textbf{Bézier splatting (Ours)} & 0.625 & 24.37 & 0.510  & 0.667 & 25.30 & 0.471   & 0.713 & 26.69 & 0.423  & \textbf{0.757} & \textbf{27.66} & \textbf{0.372}  \\
+
+%             \hline
+%         \end{tabular}
+%     }
+%     \label{tab:comparisons_kodak}
+% \end{table*}
+
+\begin{table*}[!h]
+    \centering
+    \caption{
+        A quantitative evaluation on the Kodak dataset~\cite{kodak1999} with 256 to 1024 curves. 
+        We report results on open curves.
+        % using SSIM, PSNR (higher is better), and LPIPS (lower is better).
+    }
+    \resizebox{1\textwidth}{!}{
+        \begin{tabular}{l|l|ccc|ccc|ccc}
+            \toprule
+            \multirow{2}{*} & \multirow{2}{*}{\textbf{Method}} 
+             & \multicolumn{3}{c|}{\textbf{256}} 
+             & \multicolumn{3}{c|}{\textbf{512}} 
+             & \multicolumn{3}{c}{\textbf{1024}} 
+              \\
+             
+             & & $SSIM^\uparrow$ & $PSNR^\uparrow$ & $LPIPS^\downarrow$
+               & $SSIM^\uparrow$ & $PSNR^\uparrow$ & $LPIPS^\downarrow$
+               & $SSIM^\uparrow$ & $PSNR^\uparrow$ & $LPIPS^\downarrow$ \\
+            \midrule
+
+            \multirow{2}{*}{Open} 
+            & DiffVG & 0.601 & 23.43 & 0.535  
+                    & 0.645 & 24.70 & 0.495  
+                    & 0.699 & 26.04 & 0.439   \\
+            & Ours   & \textbf{0.679} & \textbf{26.18} & \textbf{0.457}  
+                    & \textbf{0.743} & \textbf{27.90} & \textbf{0.383}  
+                    & \textbf{0.797} & \textbf{29.24} & \textbf{0.310}  \\
+
+            \midrule
+            \multirow{2}{*}{Closed} 
+            & DiffVG & \textbf{0.622} & 24.11 & \textbf{0.513}  
+                    & \textbf{0.666} & 25.34 & 0.475  
+                    & \textbf{0.719} & 26.66 & \textbf{0.420}  \\
+            % & LIVE   & \textbf{0.647} & \textbf{24.61} & \textbf{0.495}  
+            %         & \textbf{0.693} & \textbf{26.00} & \textbf{0.447}  
+            %         & \textbf{0.742} & \textbf{27.47} & \textbf{0.392}  
+            %         & - & - & - \\
+            & Ours 
+                    & 0.621 & \textbf{24.19} & 0.519 
+                    & 0.664 & \textbf{25.61} &0.485 
+                    & 0.708 & \textbf{26.91} & 0.448  \\
+            % % \multirow{3}{*}{Closed} 
+            % & DiffVG & 0.622 & 24.11 & 0.513  
+            %         & 0.666 & 25.34 & 0.475  
+            %         & 0.719 & 26.66 & 0.420  
+            %         & 0.779 & 28.17 & 0.350 \\
+            % % & LIVE   & \textbf{0.647} & \textbf{24.61} & \textbf{0.495}  
+            % %         & \textbf{0.693} & \textbf{26.00} & \textbf{0.447}  
+            % %         & \textbf{0.742} & \textbf{27.47} & \textbf{0.392}  
+            % %         & - & - & - \\
+            % & Ours 
+            %         & 0.621 & 24.19 & 0.519 
+            %         & 0.664 & 25.61 &0.485 
+            %         & 0.708 & 26.91 & 0.448  
+            %         & \textbf{0.755} & \textbf{28.02} & \textbf{0.393} \\
+            \bottomrule
+        \end{tabular}
+    }
+    \label{tab:comparisons_kodak}
+\end{table*}

@@ -1,0 +1,27 @@
+\vspace{-.5em}
+\section{Related works}
+% \vspace{-.5em}
+
+\label{sec:related_works}
+
+\vspace{-.5em}
+\subsection{Vectorization and Rasterization}
+\vspace{-.5em}
+
+Image vectorization and vector graphic (VG) rasterization are important research topics in computer graphics and computer vision. DiffVG \cite{Li:2020:DVG} introduces the first differentiable VG rasterization framework, laying a foundation for optimizing and generating vectorized representations through gradient-based methods. It expands the applicability of VGs to a broader range of tasks including image vectorization, text-to-VG generation, and painterly rendering. Based on DiffVG \cite{Li:2020:DVG}, LIVE \cite{xu2022live} and O\&R \cite{hirschorn2024optimize} further proposes a layer-wise path initialization strategy, vectorizing raster images into compact and semantically consistent VG representations while preserving image topology. Du~\emph{et al.}~\cite{Du:2023:IVE} use linear gradients to fill the regional colors, and Chen \emph{et al.}~\cite{Chen_2024_CVPR} propose a specific implicit neural representation to model regional color distributions, enhancing the color representation within closed Bézier curves. However, these DiffVG-based VG rasterization approaches \cite{Li:2020:DVG, xu2022live, Du:2023:IVE, Chen_2024_CVPR} suffer from slow optimization, often requiring several hours to process a 2K-resolution image with 1,024 curves. 
+
+With the advancement of deep learning, another line of approaches directly learns deep neural networks for vector synthesis.
+Lopes~\emph{et al.}~\cite{lopes2019learned} combine image-based encoder and VG decoder to generate fonts. Img2Vec \cite{reddy2021im2vec} integrates the encoder with recurrent neural networks (RNNs) by leveraging sequential modeling for structured vector synthesis. SVGFormer \cite{Cao_2023_CVPR} further adopts a Transformer-based architecture \cite{vaswani2017attention} to improve the capacity for representing complex geometric structures. More recently, diffusion models \cite{ho2020denoising} have been applied to text-to-VG synthesis \cite{zhang2024text, jain2023vectorfusion, xing2024svgdreamer, xing2023diffsketcher}. However, existing learning-based VG synthesis approaches are limited to generating simple graphics, and struggle with out-of-domain data. In this work, we propose a novel VG representation dubbed Bézier Splatting that achieves high-fidelity VG rendering within minutes of optimization for high-resolution images.
+
+\vspace{-.5em}
+\subsection{Gaussian Splatting} 
+\vspace{-.5em}
+
+3D Gaussian Splatting \cite{kerbl3Dgaussians, zwicker2001ewa} emerges as a promising approach for novel view synthesis (NVS) and attracts significant attention from the community. Its explicit 3D Gaussian-based volumetric representation enables high-fidelity 3D reconstruction, while the differentiable tile-based rasterization pipeline ensures real-time and high-quality rendering. It has been applied to various domains and tasks, such as 4D modeling \cite{luiten2023dynamic,Wu_2024_CVPR} and 3D scene generation \cite{yi2023gaussiandreamer, tang2024dreamgaussian}.
+Several works further improve the Gaussian primitives for better representation quality. SuGaR \cite{guedon2023sugar} proposes to approximate 3D Gaussians with 2D Gaussians for enhanced surface reconstruction. 2D Gaussian Splatting \cite{Huang2DGS2024} directly adopts 2D Gaussians for 3D reconstruction for simplified optimization and improved geometric fidelity.
+% without requiring additional mesh refinement. 
+TetSphere splatting\cite{guo2024tetsphere} further employs tetrahedral meshes as the geometric primitives to achieve high-quality geometry. 
+Particularly for 2D image representation, GaussianImage \cite{zhang2024gaussianimage} adopts 2D Gaussians \cite{Huang2DGS2024} for efficient image representation, achieving a compact and expressive alternative to rasters or implicit representations \cite{sitzmann2020implicit,muller2022instant}. 
+Image-GS \cite{zhang2024imagegscontentadaptiveimagerepresentation} further enhances it through a content-adaptive compression approach. This work proposes to integrate Gaussian splatting with vector representations for differentiable VG rasterization. By sampling 2D Gaussians on Bézier curves and rasterizing through the efficient Gaussian splatting pipeline, the proposed Bézier Splatting representation enables fast yet high-quality VG rendering, even for high-resolution images with complex structures.
+
+

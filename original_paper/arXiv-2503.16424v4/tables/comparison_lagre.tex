@@ -1,0 +1,98 @@
+\begin{table*}[!t]
+\centering
+\caption{
+    \label{tab:comparisons_div2k} Quantitative evaluation and optimization efficiency of differentiable VG methods on the DIV2K dataset \cite{Timofte_2017_CVPR_Workshops}.
+}
+\setlength{\tabcolsep}{3pt}
+\resizebox{0.99\textwidth}{!}{
+\begin{tabular}{l|l|cccc|cccc|cccc}
+\hline
+& \multirow{2}{*}{\textbf{Method}} 
+& \multicolumn{4}{c|}{\textbf{256 curves}} 
+& \multicolumn{4}{c|}{\textbf{512 curves}} 
+& \multicolumn{4}{c}{\textbf{1024 curves}} \\
+& & $SSIM^\uparrow$ & $PSNR^\uparrow$ & $LPIPS^\downarrow$ & \cellcolor{timegray}$\text{Opt.}^\downarrow$
+  & $SSIM^\uparrow$ & $PSNR^\uparrow$ & $LPIPS^\downarrow$ & \cellcolor{timegray}$\text{Opt.}^\downarrow$
+  & $SSIM^\uparrow$ & $PSNR^\uparrow$ & $LPIPS^\downarrow$ & \cellcolor{timegray}$\text{Opt.}^\downarrow$ \\
+\hline
+
+\multirow{2}{*}{Open} 
+& DiffVG~\cite{Li:2020:DVG} 
+  & \cellcolor{baselinegray}0.552 & \cellcolor{baselinegray}19.83 & \cellcolor{baselinegray}0.563 & \cellcolor{timegray}18.9min 
+  & \cellcolor{baselinegray}0.587 & \cellcolor{baselinegray}21.47 & \cellcolor{baselinegray}0.537 & \cellcolor{timegray}22.0min 
+  & \cellcolor{baselinegray}0.616 & \cellcolor{baselinegray}22.62 & \cellcolor{baselinegray}0.517 & \cellcolor{timegray}30.6min \\
+& Ours 
+  & \cellcolor{oursblue}\textbf{0.600} & \cellcolor{oursblue}\textbf{22.17} & \cellcolor{oursblue}\textbf{0.540} & \cellcolor{timegray}\textbf{3.4min}
+  & \cellcolor{oursblue}\textbf{0.646} & \cellcolor{oursblue}\textbf{23.79} & \cellcolor{oursblue}\textbf{0.498} & \cellcolor{timegray}\textbf{3.3min}
+  & \cellcolor{oursblue}\textbf{0.699} & \cellcolor{oursblue}\textbf{25.45} & \cellcolor{oursblue}\textbf{0.448} & \cellcolor{timegray}\textbf{3.2min} \\
+\hline
+
+\multirow{4}{*}{Closed} 
+& DiffVG~\cite{Li:2020:DVG}
+  & \cellcolor{baselinegray}0.578 & \cellcolor{baselinegray}20.69 & \cellcolor{baselinegray}0.548 & \cellcolor{timegray}16.4min
+  & \cellcolor{baselinegray}0.601 & \cellcolor{baselinegray}21.82 & \cellcolor{baselinegray}0.531 & \cellcolor{timegray}18.5min
+  & \cellcolor{baselinegray}0.631 & \cellcolor{baselinegray}22.95 & \cellcolor{baselinegray}0.509 & \cellcolor{timegray}25.1min \\
+& LIVE~\cite{xu2022live} 
+  & \cellcolor{baselinegray}0.576 & \cellcolor{baselinegray}20.09 & \cellcolor{baselinegray}0.543 & \cellcolor{timegray}2.6h
+  & \cellcolor{baselinegray}0.611 & \cellcolor{baselinegray}21.70 & \cellcolor{baselinegray}\textbf{0.521} & \cellcolor{timegray}4.2h
+  & \cellcolor{baselinegray}0.648 & \cellcolor{baselinegray}23.11 & \cellcolor{baselinegray}0.495 & \cellcolor{timegray}5.1h \\
+& LIVSS~\cite{livss} 
+  & \cellcolor{baselinegray}\textbf{0.586} & \cellcolor{baselinegray}17.71 & \cellcolor{baselinegray}\textbf{0.542} & \cellcolor{timegray}39.2min
+  & \cellcolor{baselinegray}\textbf{0.630} & \cellcolor{baselinegray}18.71 & \cellcolor{baselinegray}0.530 & \cellcolor{timegray}54.3min
+  & \cellcolor{baselinegray}\textbf{0.678} & \cellcolor{baselinegray}19.83 & \cellcolor{baselinegray}0.517 & \cellcolor{timegray}1.4h \\
+& Ours 
+  & \cellcolor{oursblue}0.580 & \cellcolor{oursblue}\textbf{20.74} & \cellcolor{oursblue}0.546 & \cellcolor{timegray}\textbf{7.8min}
+  & \cellcolor{oursblue}0.607 & \cellcolor{oursblue}\textbf{22.11} & \cellcolor{oursblue}0.528 & \cellcolor{timegray}\textbf{8.3min}
+  & \cellcolor{oursblue}0.639 & \cellcolor{oursblue}\textbf{23.45} & \cellcolor{oursblue}\textbf{0.507} & \cellcolor{timegray}\textbf{8.6min} \\
+\hline
+\end{tabular}
+}
+\end{table*}
+
+
+
+
+% \begin{table*}[!h]
+%     \centering
+%     \caption{
+%         \label{tab:comparisons} Quantitative evaluation of DIV2K\_HR
+%     }
+%     \vspace{-.5em}
+%     \resizebox{0.85\textwidth}{!}{
+%         \begin{tabular}{l|l|cccc|cccc}
+%         \toprule
+%             & \multirow{2}{*} {\textbf{Method} / \textbf{Curve \#} } & \multicolumn{4}{c|}{\textbf{256}} & \multicolumn{4}{c}{\textbf{512}} \\
+                        
+%             &  & $SSIM^\uparrow$   & $PSNR^\uparrow$    & $LPIPS^\downarrow$  & Train & $SSIM^\uparrow$   & $PSNR^\uparrow$    & $LPIPS^\downarrow$  & Train \\
+%             \hline
+            
+%             \multirow{2}{*}{Open} 
+%             & DiffVG & 0.552 & 19.83 & 0.563 & 18m56s & 0.587 & 21.47 & 0.537 & 22m01s \\
+%             & Bézier splatting (ours) & \textbf{0.600} & \textbf{22.17} & \textbf{0.540} & \textbf{3m37s} & \textbf{0.646} & \textbf{23.79} & \textbf{0.498} & \textbf{3m21s} \\
+            
+%             \hline
+%             \multirow{3}{*}{Closed} 
+%             & DiffVG & 0.578 & 20.69 & 0.548 & 16m27s & 0.601 & 21.82 & 0.531 & 18m35s \\
+%             & LIVE  & 0.576 & 20.09 & \textbf{0.543} & 2h41m & \textbf{0.611} & 21.70 & \textbf{0.521} & 4h12m \\
+%             & Bézier splatting (ours) & \textbf{0.581} & \textbf{20.74} & 0.547 & \textbf{2m22s} & \textbf{0.611} & \textbf{22.14} & 0.522 & \textbf{2m45s} \\
+
+%             \hline
+%             & \multirow{2}{*} {\textbf{Method} / \textbf{Curve \#} } & \multicolumn{4}{c|}{\textbf{1024}} & \multicolumn{4}{c}{\textbf{2048}} \\
+                        
+%             &  & $SSIM^\uparrow$   & $PSNR^\uparrow$    & $LPIPS^\downarrow$  & Train & $SSIM^\uparrow$   & $PSNR^\uparrow$    & $LPIPS^\downarrow$  & Train \\
+%             \hline
+            
+%             \multirow{2}{*}{Open} 
+%             & DiffVG & 0.616 & 22.62 & 0.517 & 30m38s & 0.654 & 23.89 & 0.492 & 46m36s \\
+%             & Bézier splatting (ours) & \textbf{0.699} & \textbf{25.45} & \textbf{0.448} & \textbf{3m17s} & \textbf{0.756} & \textbf{27.22} & \textbf{0.389} & \textbf{3m24s} \\
+            
+%             \hline
+%             \multirow{3}{*}{Closed} 
+%             & DiffVG & 0.631 & 22.95 & 0.509 & 25m08s & 0.668 & 24.21 & 0.482 & 34m16s \\
+%             & LIVE  & \textbf{0.648} & 23.11 & 0.495 & 5h6m& - & - & - & - \\
+%             & Bézier splatting (ours) & \textbf{0.648} & \textbf{23.55} & \textbf{0.491} & \textbf{3m25s} & \textbf{0.690} & \textbf{24.93} & \textbf{0.454} & \textbf{4m46s} \\
+
+%             \hline
+%         \end{tabular}
+%     }
+% \end{table*}

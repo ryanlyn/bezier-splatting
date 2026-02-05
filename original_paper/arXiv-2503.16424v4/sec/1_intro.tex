@@ -1,0 +1,21 @@
+\vspace{-1em}
+
+\section{Introduction}
+\label{sec:intro}
+\vspace{-.5em}
+
+Vector graphics (VGs) represent images through parametric primitives such as points, curves, and shapes. Unlike raster images, they enable structured representations, lossless resizing, compact storage, and precise content editing, making them crucial for various applications such as user interfaces and animation. 
+
+Recently, differentiable VG rasterization gains significant attention, as it allows raster-based algorithms to edit or synthesize VGs through gradient-based optimization. DiffVG \cite{Li:2020:DVG} is the first differentiable VG framework that leverages the anti-aliasing algorithm to differentiate the vector curves that are inherently discontinuous in pixel space. However, it suffers from slow training and low-fidelity rendering, particularly for high-resolution images. LIVE \cite{xu2022live} further introduces a layer-wise coarse-to-fine strategy to improve quality and topology. However, it is highly computationally expensive, requiring 5 hours to vectorize a 2K-resolution image. Additionally, learning-based methods such as Im2Vec \cite{reddy2021im2vec} train neural networks to map pixels to VGs, but they are restricted to simple graphics and struggle with out-of-domain generalization. Towards scalable applications of VGs, these challenges highlight the need for a differentiable VG method with better efficiency, fidelity, and generalization capability. 
+
+This work presents \emph{Bézier Splatting}, a new differentiable VG representation that optimizes Bézier curves through Gaussian splatting-based rasterization. We sample 2D Gaussian points along Bézier curves and their interior regions, then leverage the Gaussian Splatting framework \cite{kerbl3Dgaussians} for efficient curve rasterization. Unlike DiffVG \cite{Li:2020:DVG} which requires computationally intensive boundary sampling and gradient computation, 2D Gaussians inherently provide direct positional gradients at object boundaries through its differentiable Gaussian formulation, enabling over \emph{150$\times$} faster backward computation over DiffVG for open curves. We further introduce an adaptive pruning and densification strategy that adaptively removes redundant curves while adding new ones to necessary regions during optimization. It helps the optimization process escape the local minima of current spatial distributions of curves, formulating a ``global receptive field'' for further improving the VG optimization process. As shown in Fig. \ref{fig:teaser}, Bézier Splatting outperforms the state-of-the-art differentiable VG rasterizer DiffVG \cite{Li:2020:DVG} for both open and closed curves in terms of efficiency and rendering quality.
+% The open curve training takes only $2.9$ minutes, representing an over \emph{10}$\times$ training acceleration compared to DiffVG \cite{Li:2020:DVG} (43 minutes). 
+% Bézier Splatting presents better image details and captures fine-grained texture information,
+% for instance, the richer facial details.
+% While LIVE \cite{Du:2023:IVE} enhances details to some extent, its layer-wise optimization strategy results in artifacts like non-smooth shape boundaries on the sky as well as significantly more computing cost, whereas Bézier Splatting enables 88$\times$ training acceleration. 
+We summarize the contribution of this work as follows.
+\begin{itemize}\setlength{\itemsep}{3pt}
+    \item We propose a novel differentiable vector graphic representation, Bézier Splatting, which achieves an order-of-magnitude computational speedup while producing high-quality rendering results. 
+    \item We present an adaptive pruning and densification strategy to improve the optimization process of Bézier curves by escaping the local minima of the spatial distributions of curves.
+    \item Extensive experiments demonstrate that Bézier Splatting outperforms existing differentiable VG rendering methods in efficiency and visual quality.
+\end{itemize}
