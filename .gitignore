@@ -42,3 +42,9 @@ htmlcov/
 Thumbs.db
 
 tests/outputs/
+
+# Gas Town (added by gt)
+.runtime/
+.claude/
+.beads/
+.logs/
