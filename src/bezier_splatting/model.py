@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from .area import closed_curve_enclosed_area
 from .rasterizer import rasterize
 from .sampling import ClosedCurveSampler, GaussianParams, OpenCurveSampler
 
@@ -171,11 +172,9 @@ class VectorGraphicsScene(nn.Module):
             )
             if closed_g.means.shape[0] > 0:
                 all_gaussians.append(closed_g)
-                # Per-curve area from bounding box of CPs
+                # Per-curve area using true enclosed area (not bounding box)
                 bcp_px = bcp * torch.tensor([W, H], device=bcp.device, dtype=bcp.dtype)
-                cp_flat = bcp_px.reshape(bcp_px.shape[0], -1, 2)
-                bb = cp_flat.max(dim=1).values - cp_flat.min(dim=1).values
-                areas = bb[:, 0] * bb[:, 1]  # (N,)
+                areas = closed_curve_enclosed_area(bcp_px)  # (N,)
                 R_total = self.closed_sampler.num_intermediate + 2
                 K = self.closed_sampler.samples_per_curve
                 curve_areas.append((areas, R_total * K))
