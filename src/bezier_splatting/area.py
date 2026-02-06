@@ -3,13 +3,12 @@
 Uses Green's theorem to compute exact enclosed area between paired boundary curves.
 """
 
-from __future__ import annotations
-
 import torch
+from jaxtyping import Float
 from torch import Tensor
 
 
-def bezier_signed_area(control_points: Tensor) -> Tensor:
+def bezier_signed_area(control_points: Float[Tensor, "*batch CP 2"]) -> Float[Tensor, " *batch"]:
     """Compute signed area under a Bézier curve using the trapezoidal rule.
 
     The "signed area" is the area between the curve and the x-axis. For a closed
@@ -42,7 +41,7 @@ def bezier_signed_area(control_points: Tensor) -> Tensor:
     return signed_area
 
 
-def closed_curve_enclosed_area(boundary_cp: Tensor) -> Tensor:
+def closed_curve_enclosed_area(boundary_cp: Float[Tensor, "N 2 CP 2"]) -> Float[Tensor, " N"]:
     """Compute true enclosed area between two paired boundary curves.
 
     The paired Bézier structure has two boundary curves that share start and

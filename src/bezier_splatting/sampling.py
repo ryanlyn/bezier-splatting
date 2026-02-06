@@ -4,12 +4,11 @@ Control points are stored in normalized [0, 1] coordinates and scaled to
 pixel coordinates at sampling time via (H, W) arguments.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from jaxtyping import Float, Int
 from torch import Tensor
 
 from .bezier import evaluate_bezier, evaluate_composite_bezier, composite_segment_sizes
@@ -19,14 +18,14 @@ from .bezier import evaluate_bezier, evaluate_composite_bezier, composite_segmen
 class GaussianParams:
     """Parameters for a set of 2D Gaussians ready for rasterization."""
 
-    means: Tensor       # (G, 2) — center positions in pixel coords
-    scales: Tensor      # (G, 2) — [σ_x, σ_y] standard deviations
-    rotations: Tensor   # (G,)   — rotation angle θ in radians
-    colors: Tensor      # (G, 3) — RGB in [0, 1]
-    opacities: Tensor   # (G,)   — pre-sigmoid opacity
-    curve_ids: Tensor   # (G,)   — which curve each Gaussian belongs to (for per-curve depth)
+    means: Float[Tensor, "G 2"]       # center positions in pixel coords
+    scales: Float[Tensor, "G 2"]      # [σ_x, σ_y] standard deviations
+    rotations: Float[Tensor, " G"]    # rotation angle θ in radians
+    colors: Float[Tensor, "G 3"]      # RGB in [0, 1]
+    opacities: Float[Tensor, " G"]    # pre-sigmoid opacity
+    curve_ids: Int[Tensor, " G"]      # which curve each Gaussian belongs to (for per-curve depth)
 
-    def concat(self, other: GaussianParams) -> GaussianParams:
+    def concat(self, other: "GaussianParams") -> "GaussianParams":
         """Concatenate two GaussianParams along the Gaussian dimension."""
         return GaussianParams(
             means=torch.cat([self.means, other.means], dim=0),
@@ -38,7 +37,7 @@ class GaussianParams:
         )
 
 
-def _central_diff_angles(points: Tensor) -> Tensor:
+def _central_diff_angles(points: Float[Tensor, "*batch K 2"]) -> Float[Tensor, "*batch K"]:
     """Rotation angles via central differences of sampled points (paper Eq. 8).
 
     Args:
@@ -74,10 +73,10 @@ class OpenCurveSampler:
 
     def __call__(
         self,
-        control_points: Tensor,  # (N, 10, 2) in [0, 1]
-        colors: Tensor,          # (N, 3) already in [0, 1]
-        opacities: Tensor,       # (N, 3) pre-sigmoid, one per segment
-        stroke_widths: Tensor,   # (N,) pre-sigmoid
+        control_points: Float[Tensor, "N 10 2"],
+        colors: Float[Tensor, "N 3"],
+        opacities: Float[Tensor, "N 3"],
+        stroke_widths: Float[Tensor, " N"],
         H: int = 256,
         W: int = 256,
         curve_id_offset: int = 0,
@@ -169,9 +168,9 @@ class ClosedCurveSampler:
 
     def __call__(
         self,
-        boundary_cp: Tensor,  # (N, 2, num_cp, 2) in [0, 1], shared endpoints
-        colors: Tensor,       # (N, 3)
-        opacities: Tensor,    # (N,)
+        boundary_cp: Float[Tensor, "N 2 CP 2"],
+        colors: Float[Tensor, "N 3"],
+        opacities: Float[Tensor, " N"],
         H: int = 256,
         W: int = 256,
         curve_id_offset: int = 0,

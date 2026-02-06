@@ -4,24 +4,23 @@ Control points are stored in [0, 1] normalized coordinates and
 scaled to pixel space for SVG output.
 """
 
-from __future__ import annotations
-
 import torch
+from jaxtyping import Float
 from torch import Tensor
 
 from .area import closed_curve_enclosed_area
 from .model import VectorGraphicsScene
 
 
-def _rgb_str(color: Tensor) -> str:
+def _rgb_str(color: Float[Tensor, " 3"]) -> str:
     """Convert (3,) float tensor in [0,1] to CSS rgb string."""
     r, g, b = (color.clamp(0, 1) * 255).int().tolist()
     return f"rgb({r},{g},{b})"
 
 
 def _open_curve_to_path(
-    control_points: Tensor,
-    color: Tensor,
+    control_points: Float[Tensor, "10 2"],
+    color: Float[Tensor, " 3"],
     opacity: float,
     stroke_width: float,
     H: int,
@@ -58,8 +57,8 @@ def _open_curve_to_path(
 
 
 def _closed_curve_to_path(
-    boundary_cp: Tensor,
-    color: Tensor,
+    boundary_cp: Float[Tensor, "2 CP 2"],
+    color: Float[Tensor, " 3"],
     opacity: float,
     H: int,
     W: int,

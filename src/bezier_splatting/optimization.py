@@ -6,14 +6,13 @@ paper-aligned pruning/densification with StepLR decay.
 All control points are stored in [0, 1] normalized coordinates.
 """
 
-from __future__ import annotations
-
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Float
 from torch import Tensor
 
 from .area import closed_curve_enclosed_area
@@ -23,7 +22,7 @@ from .model import VectorGraphicsScene
 # ── Xing Loss (LIVE method) ─────────────────────────────────────────────
 
 
-def _sine_theta(a: Tensor, b: Tensor) -> Tensor:
+def _sine_theta(a: Float[Tensor, "N 2"], b: Float[Tensor, "N 2"]) -> Float[Tensor, " N"]:
     """Signed sine of the angle between 2D vector pairs.
 
     Args:
@@ -37,7 +36,12 @@ def _sine_theta(a: Tensor, b: Tensor) -> Tensor:
     return cross / norms
 
 
-def _xing_loss_cubic(p0: Tensor, p1: Tensor, p2: Tensor, p3: Tensor) -> Tensor:
+def _xing_loss_cubic(
+    p0: Float[Tensor, "N 2"],
+    p1: Float[Tensor, "N 2"],
+    p2: Float[Tensor, "N 2"],
+    p3: Float[Tensor, "N 2"],
+) -> Float[Tensor, " N"]:
     """LIVE Xing loss for a batch of cubic Bézier segments.
 
     Penalizes self-intersecting control polygons using direction-gated
@@ -64,7 +68,7 @@ def _xing_loss_cubic(p0: Tensor, p1: Tensor, p2: Tensor, p3: Tensor) -> Tensor:
     return loss
 
 
-def _xing_loss(scene: VectorGraphicsScene) -> Tensor:
+def _xing_loss(scene: VectorGraphicsScene) -> Float[Tensor, ""]:
     """Total Xing loss for all curves in the scene.
 
     Open curves: 3 cubic segments each (CPs [0:4], [3:7], [6:10]).
@@ -115,7 +119,7 @@ def _xing_loss(scene: VectorGraphicsScene) -> Tensor:
 
 
 def fit_image(
-    target: Tensor,
+    target: Float[Tensor, "3 H W"],
     n_open: int = 128,
     n_closed: int = 64,
     steps: int = 15000,
@@ -317,8 +321,8 @@ def _build_param_groups(scene: VectorGraphicsScene, H: int, W: int) -> list[dict
 
 def _prune_and_densify(
     scene: VectorGraphicsScene,
-    target: Tensor,
-    rendered: Tensor,
+    target: Float[Tensor, "3 H W"],
+    rendered: Float[Tensor, "3 H W"],
     step: int,
     total_steps: int,
     H: int,
@@ -408,8 +412,8 @@ def _prune_and_densify(
 
 def _densify_curves(
     scene: VectorGraphicsScene,
-    error_map: Tensor,
-    target: Tensor,
+    error_map: Float[Tensor, "H W"],
+    target: Float[Tensor, "3 H W"],
     n_new: int,
     H: int,
     W: int,
@@ -543,7 +547,7 @@ def _densify_curves(
 def _make_open_curve(
     cx_px: float, cy_px: float,
     H: int, W: int,
-    color: Tensor, device: torch.device,
+    color: Float[Tensor, " 3"], device: torch.device,
     out_cps: list[Tensor], out_colors: list[Tensor],
 ) -> None:
     """Create one new open curve in [0, 1] coords near a pixel center."""
@@ -564,7 +568,7 @@ def _make_open_curve(
 def _make_closed_curve(
     cx_px: float, cy_px: float,
     H: int, W: int,
-    num_cp: int, color: Tensor, device: torch.device,
+    num_cp: int, color: Float[Tensor, " 3"], device: torch.device,
     out_cps: list[Tensor], out_colors: list[Tensor],
 ) -> None:
     """Create one new closed curve in [0, 1] coords near a pixel center."""

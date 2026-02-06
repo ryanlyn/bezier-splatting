@@ -4,12 +4,11 @@ All control points are stored in [0, 1] normalized coordinates.
 Scaling to pixel coordinates happens at sampling/rendering time.
 """
 
-from __future__ import annotations
-
 import math
 
 import torch
 import torch.nn as nn
+from jaxtyping import Float
 from torch import Tensor
 
 from .area import closed_curve_enclosed_area
@@ -76,7 +75,7 @@ class VectorGraphicsScene(nn.Module):
         )
 
     @staticmethod
-    def _init_open_cps(n: int) -> Tensor:
+    def _init_open_cps(n: int) -> Float[Tensor, "N 10 2"]:
         """Initialize open curve CPs in [0, 1] normalized coords."""
         centers = torch.rand(n, 2)
         t = torch.linspace(-1, 1, 10).unsqueeze(0).unsqueeze(-1)
@@ -86,7 +85,7 @@ class VectorGraphicsScene(nn.Module):
         return cps.clamp(0, 1)
 
     @staticmethod
-    def _init_closed_cps(n: int, num_cp: int) -> tuple[Tensor, Tensor]:
+    def _init_closed_cps(n: int, num_cp: int) -> tuple[Float[Tensor, "N 2 2"], Float[Tensor, "N 2 interior 2"]]:
         """Initialize closed curve boundary CPs with shared endpoints.
 
         Returns:
@@ -114,7 +113,7 @@ class VectorGraphicsScene(nn.Module):
 
         return shared_pts, interior_cp
 
-    def _assemble_boundary_cp(self) -> Tensor:
+    def _assemble_boundary_cp(self) -> Float[Tensor, "N 2 CP 2"]:
         """Reconstruct full (N, 2, num_cp, 2) from shared endpoints + interior CPs.
 
         Both boundaries share the exact same start/end points because they
@@ -129,7 +128,7 @@ class VectorGraphicsScene(nn.Module):
         return torch.cat([start, self.closed_interior_cp, end], dim=2)
 
     @property
-    def closed_boundary_cp(self) -> Tensor:
+    def closed_boundary_cp(self) -> Float[Tensor, "N 2 CP 2"]:
         """Assembled (N, 2, num_cp, 2) boundary CPs with shared endpoints.
 
         Read-only view for backward compatibility. For parameter access,
@@ -213,7 +212,7 @@ class VectorGraphicsScene(nn.Module):
             curve_ids=combined.curve_ids[sort_indices],
         )
 
-    def forward(self, H: int | None = None, W: int | None = None) -> Tensor:
+    def forward(self, H: int | None = None, W: int | None = None) -> Float[Tensor, "3 H W"]:
         """Render the scene."""
         H = H or self.H
         W = W or self.W
