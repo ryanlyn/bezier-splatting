@@ -143,8 +143,9 @@ class VectorGraphicsScene(nn.Module):
         n_closed are zero or all samplers produce empty output).
         """
         all_gaussians: list[GaussianParams] = []
-        curve_areas: list[tuple[Tensor, int]] = []  # (area_per_curve, n_gaussians_per_curve)
         curve_id_offset = 0
+        has_open_gaussians = False
+        has_closed_gaussians = False
 
         # ── Sample from open curves ──
         if self.n_open > 0:
@@ -158,15 +159,11 @@ class VectorGraphicsScene(nn.Module):
             )
             if open_g.means.shape[0] > 0:
                 all_gaussians.append(open_g)
-                cp_px = self.open_control_points * torch.tensor([W, H], device=self.open_control_points.device, dtype=self.open_control_points.dtype)
-                edge_len = torch.norm(cp_px[:, 1:] - cp_px[:, :-1], dim=-1).sum(dim=-1)  # (N,)
-                sw = 0.5 + torch.sigmoid(self.open_stroke_widths) * 4.5
-                areas = edge_len * sw  # (N,)
-                K = self.open_sampler.samples_per_curve
-                curve_areas.append((areas, K))
+                has_open_gaussians = True
             curve_id_offset += self.n_open
 
         # ── Sample from closed curves ──
+        bcp: Tensor | None = None
         if self.n_closed > 0:
             bcp = self._assemble_boundary_cp()
             closed_g = self.closed_sampler(
@@ -178,11 +175,7 @@ class VectorGraphicsScene(nn.Module):
             )
             if closed_g.means.shape[0] > 0:
                 all_gaussians.append(closed_g)
-                bcp_px = bcp * torch.tensor([W, H], device=bcp.device, dtype=bcp.dtype)
-                areas = closed_curve_enclosed_area(bcp_px)  # (N,)
-                R_total = self.closed_sampler.num_intermediate + 2
-                K = self.closed_sampler.samples_per_curve
-                curve_areas.append((areas, R_total * K))
+                has_closed_gaussians = True
 
         if len(all_gaussians) == 0:
             return None
@@ -196,13 +189,30 @@ class VectorGraphicsScene(nn.Module):
                 combined = combined.concat(g)
 
         # ── Per-curve depth sort (paper Sec 3.3) ──
-        all_areas_list = []
-        for areas, gaussians_per_curve in curve_areas:
-            expanded = areas.unsqueeze(1).expand(-1, gaussians_per_curve).reshape(-1)
-            all_areas_list.append(expanded)
-        all_areas = torch.cat(all_areas_list, dim=0)
+        # Areas only feed into discrete argsort indices — no useful gradients.
+        with torch.no_grad():
+            curve_areas: list[tuple[Tensor, int]] = []
+            if has_open_gaussians:
+                cp_px = self.open_control_points * torch.tensor([W, H], device=self.open_control_points.device, dtype=self.open_control_points.dtype)
+                edge_len = torch.norm(cp_px[:, 1:] - cp_px[:, :-1], dim=-1).sum(dim=-1)
+                sw = 0.5 + torch.sigmoid(self.open_stroke_widths) * 4.5
+                areas = edge_len * sw
+                K = self.open_sampler.samples_per_curve
+                curve_areas.append((areas, K))
+            if has_closed_gaussians:
+                assert bcp is not None
+                bcp_px = bcp * torch.tensor([W, H], device=bcp.device, dtype=bcp.dtype)
+                areas = closed_curve_enclosed_area(bcp_px)
+                R_total = self.closed_sampler.num_intermediate + 2
+                K = self.closed_sampler.samples_per_curve
+                curve_areas.append((areas, R_total * K))
 
-        sort_indices = torch.argsort(all_areas, descending=False)
+            all_areas_list = []
+            for areas, gaussians_per_curve in curve_areas:
+                expanded = areas.unsqueeze(1).expand(-1, gaussians_per_curve).reshape(-1)
+                all_areas_list.append(expanded)
+            all_areas = torch.cat(all_areas_list, dim=0)
+            sort_indices = torch.argsort(all_areas, descending=False)
         return GaussianParams(
             means=combined.means[sort_indices],
             scales=combined.scales[sort_indices],

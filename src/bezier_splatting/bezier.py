@@ -4,6 +4,8 @@ import torch
 from jaxtyping import Float
 from torch import Tensor
 
+_BINOM_COEFFS: dict[int, list[int]] = {1: [1, 1], 2: [1, 2, 1], 3: [1, 3, 3, 1]}
+
 
 def bernstein_basis(t: Float[Tensor, " *batch"], degree: int) -> Float[Tensor, "*batch M1"]:
     """Evaluate Bernstein basis polynomials B_j^M(t).
@@ -17,16 +19,18 @@ def bernstein_basis(t: Float[Tensor, " *batch"], degree: int) -> Float[Tensor, "
     Returns:
         Bernstein basis values. Shape: (*batch, degree + 1)
     """
-    # Precompute binomial coefficients C(degree, j) for j = 0..degree
-    j = torch.arange(degree + 1, device=t.device, dtype=t.dtype)
-    # Use lgamma for numerical stability: C(M,j) = exp(lgamma(M+1) - lgamma(j+1) - lgamma(M-j+1))
-    log_binom = (
-        torch.lgamma(torch.tensor(degree + 1, device=t.device, dtype=t.dtype))
-        - torch.lgamma(j + 1)
-        - torch.lgamma(torch.tensor(degree, device=t.device, dtype=t.dtype) - j + 1)
-    )
-    binom = torch.exp(log_binom)  # (degree + 1,)
+    if degree in _BINOM_COEFFS:
+        binom = torch.tensor(_BINOM_COEFFS[degree], device=t.device, dtype=t.dtype)
+    else:
+        j = torch.arange(degree + 1, device=t.device, dtype=t.dtype)
+        log_binom = (
+            torch.lgamma(torch.tensor(degree + 1, device=t.device, dtype=t.dtype))
+            - torch.lgamma(j + 1)
+            - torch.lgamma(torch.tensor(degree, device=t.device, dtype=t.dtype) - j + 1)
+        )
+        binom = torch.exp(log_binom)  # (degree + 1,)
 
+    j = torch.arange(degree + 1, device=t.device, dtype=t.dtype)
     t = t.unsqueeze(-1)  # (*batch, 1)
     # B_j^M(t) = C(M,j) * t^j * (1-t)^(M-j)
     basis = binom * t.pow(j) * (1 - t).pow(degree - j)  # (*batch, degree+1)
@@ -82,7 +86,11 @@ def composite_segment_sizes(num_samples: int) -> list[int]:
     return [base + (1 if i < remainder else 0) for i in range(3)]
 
 
-def evaluate_composite_bezier(control_points: Float[Tensor, "N 10 2"], num_samples: int) -> tuple[Float[Tensor, "N K 2"], Float[Tensor, "N K 2"]]:
+def evaluate_composite_bezier(
+    control_points: Float[Tensor, "N 10 2"],
+    num_samples: int,
+    compute_tangents: bool = True,
+) -> tuple[Float[Tensor, "N K 2"], Float[Tensor, "N K 2"] | None]:
     """Evaluate a composite Bézier curve (3 connected cubics sharing endpoints).
 
     The 10 control points are split into 3 segments:
@@ -93,10 +101,11 @@ def evaluate_composite_bezier(control_points: Float[Tensor, "N 10 2"], num_sampl
     Args:
         control_points: Shape (num_curves, 10, 2)
         num_samples: Total number of samples across all segments.
+        compute_tangents: If False, skip tangent computation and return None.
 
     Returns:
-        Tuple of (points, tangents), each shape (num_curves, num_samples, 2).
-        Points are ordered along the full curve from t=0 to t=1.
+        Tuple of (points, tangents). Points shape (num_curves, num_samples, 2).
+        Tangents same shape, or None if compute_tangents is False.
     """
     # Distribute samples across 3 segments
     seg_sizes = composite_segment_sizes(num_samples)
@@ -109,7 +118,7 @@ def evaluate_composite_bezier(control_points: Float[Tensor, "N 10 2"], num_sampl
     ], dim=1)  # (num_curves, 3, 4, 2)
 
     all_points = []
-    all_tangents = []
+    all_tangents = [] if compute_tangents else None
     for seg_idx in range(3):
         n = seg_sizes[seg_idx]
         if n == 0:
@@ -122,10 +131,11 @@ def evaluate_composite_bezier(control_points: Float[Tensor, "N 10 2"], num_sampl
 
         cp = seg_cps[:, seg_idx]  # (num_curves, 4, 2)
         pts = evaluate_bezier(cp, t)  # (num_curves, n, 2)
-        tng = bezier_tangent(cp, t)   # (num_curves, n, 2)
         all_points.append(pts)
-        all_tangents.append(tng)
+        if compute_tangents:
+            tng = bezier_tangent(cp, t)   # (num_curves, n, 2)
+            all_tangents.append(tng)
 
     points = torch.cat(all_points, dim=1)    # (num_curves, ~num_samples, 2)
-    tangents = torch.cat(all_tangents, dim=1)
+    tangents = torch.cat(all_tangents, dim=1) if compute_tangents else None
     return points, tangents

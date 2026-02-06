@@ -99,8 +99,8 @@ class OpenCurveSampler:
         scale = torch.tensor([W, H], device=device, dtype=control_points.dtype)
         cp_px = control_points * scale
 
-        # Evaluate composite curve at K points
-        points, _tangents = evaluate_composite_bezier(cp_px, K)
+        # Evaluate composite curve at K points (tangents unused — central diffs below)
+        points, _ = evaluate_composite_bezier(cp_px, K, compute_tangents=False)
         # points: (N, K, 2)
 
         # Rotation from central differences of sampled points (paper Eq. 8)

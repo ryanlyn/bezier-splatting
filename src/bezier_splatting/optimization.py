@@ -193,7 +193,6 @@ def fit_image(
     param_groups = _build_param_groups(scene, H, W)
     optimizer = torch.optim.Adam(param_groups)
 
-    loss_history: list[float] = []
     lr_decay = 1.0  # accumulated decay factor
 
     for step in range(steps):
@@ -218,8 +217,9 @@ def fit_image(
 
         optimizer.step()
 
-        loss_val = loss.item()
-        loss_history.append(loss_val)
+        # Defer loss.item() GPU-CPU sync to when we actually need the value
+        need_loss_val = debug or callback is not None or step % log_every == 0
+        loss_val = loss.item() if need_loss_val else 0.0
 
         if debug:
             psnr_val = compute_psnr(rendered.detach(), target).item()
