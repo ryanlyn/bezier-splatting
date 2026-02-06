@@ -1,7 +1,5 @@
 """Data collectors for gradient statistics, curve stats, and scene snapshots."""
 
-from __future__ import annotations
-
 import torch
 from torch import Tensor
 
