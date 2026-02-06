@@ -129,6 +129,7 @@ def fit_image(
     log_every: int = 100,
     lr_step_size: int = 5000,
     lr_gamma: float = 0.5,
+    lr_scale: float = 1.0,
     callback: Callable[[int, float, VectorGraphicsScene], None] | None = None,
     debug: bool | str = False,
 ) -> VectorGraphicsScene:
@@ -145,6 +146,7 @@ def fit_image(
         log_every: Print loss every N steps.
         lr_step_size: StepLR decay period.
         lr_gamma: StepLR multiplicative decay factor.
+        lr_scale: Global multiplier applied to all base learning rates.
         callback: Optional callback(step, loss, scene) for monitoring.
             If the callback returns ``False``, training stops early.
         debug: When truthy, activate debug logging. When a string, use it as
@@ -190,7 +192,7 @@ def fit_image(
         n_open=n_open, n_closed=n_closed, H=H, W=W,
     ).to(device)
 
-    param_groups = _build_param_groups(scene, H, W)
+    param_groups = _build_param_groups(scene, H, W, lr_scale=lr_scale)
     optimizer = torch.optim.Adam(param_groups)
 
     lr_decay = 1.0  # accumulated decay factor
@@ -275,7 +277,7 @@ def fit_image(
                 tracker.log_snapshot(step, "rendered_at_prune", {"image": rendered_at_prune.detach().cpu()})
 
             # Rebuild optimizer (fresh Adam state for new params)
-            param_groups = _build_param_groups(scene, H, W)
+            param_groups = _build_param_groups(scene, H, W, lr_scale=lr_scale)
             optimizer = torch.optim.Adam(param_groups)
             # Apply accumulated lr decay to new optimizer
             for group in optimizer.param_groups:
@@ -287,30 +289,32 @@ def fit_image(
     return scene
 
 
-def _build_param_groups(scene: VectorGraphicsScene, H: int, W: int) -> list[dict]:
+def _build_param_groups(
+    scene: VectorGraphicsScene, H: int, W: int, lr_scale: float = 1.0,
+) -> list[dict]:
     """Build optimizer parameter groups with per-type learning rates.
 
     Control points are in [0, 1] normalized coordinates. The CP learning rate
     is scaled by resolution so the effective pixel displacement is ~0.25 px/iter
-    regardless of image size.
+    regardless of image size. All base LRs are multiplied by ``lr_scale``.
     """
-    cp_lr = 0.25 / max(H, W)
+    cp_lr = 0.25 / max(H, W) * lr_scale
     groups: list[dict] = []
 
     if scene.n_open > 0:
         groups.extend([
             {"params": [scene.open_control_points], "lr": cp_lr, "name": "open_cp"},
-            {"params": [scene.open_colors], "lr": 0.01, "name": "open_colors"},
-            {"params": [scene.open_opacities], "lr": 0.1, "name": "open_opacities"},
-            {"params": [scene.open_stroke_widths], "lr": 0.05, "name": "open_stroke_widths"},
+            {"params": [scene.open_colors], "lr": 0.01 * lr_scale, "name": "open_colors"},
+            {"params": [scene.open_opacities], "lr": 0.1 * lr_scale, "name": "open_opacities"},
+            {"params": [scene.open_stroke_widths], "lr": 0.05 * lr_scale, "name": "open_stroke_widths"},
         ])
 
     if scene.n_closed > 0:
         groups.extend([
             {"params": [scene.closed_shared_pts], "lr": cp_lr, "name": "closed_shared_pts"},
             {"params": [scene.closed_interior_cp], "lr": cp_lr, "name": "closed_interior_cp"},
-            {"params": [scene.closed_colors], "lr": 0.01, "name": "closed_colors"},
-            {"params": [scene.closed_opacities], "lr": 0.1, "name": "closed_opacities"},
+            {"params": [scene.closed_colors], "lr": 0.01 * lr_scale, "name": "closed_colors"},
+            {"params": [scene.closed_opacities], "lr": 0.1 * lr_scale, "name": "closed_opacities"},
         ])
 
     return groups

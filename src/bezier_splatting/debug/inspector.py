@@ -103,6 +103,160 @@ def _find_snapshot_near_step(
     return min(snapshots, key=lambda x: abs(x[0] - step))
 
 
+def _render_curve_overlay(scene: VectorGraphicsScene, H: int, W: int) -> np.ndarray:
+    """Render the true Bezier curves from a scene as an (H, W, 3) uint8 numpy image.
+
+    Uses matplotlib Path/PathPatch to draw the exact cubic Bezier geometry
+    (open curves as stroked paths, closed curves as filled regions).
+    Curves are depth-sorted by area (largest first = background) to match
+    the rasterizer's compositing order.
+
+    Linewidths are converted from data-space pixels to matplotlib display
+    points so that stroke widths visually match the Gaussian rendering.
+    Closed curve fills include a border stroke sized to the boundary
+    Gaussian sigma_y extent.
+    """
+    from matplotlib.patches import PathPatch
+    from matplotlib.path import Path as MplPath
+
+    from ..area import closed_curve_enclosed_area
+    from ..bezier import evaluate_bezier
+
+    fig, ax = plt.subplots(1, 1, figsize=(4, 4), dpi=96)
+    ax.set_xlim(0, W)
+    ax.set_ylim(H, 0)  # flip y so (0,0) is top-left
+    ax.set_aspect("equal")
+    ax.axis("off")
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+
+    scale = torch.tensor([W, H], dtype=torch.float32)
+
+    # Convert data-space pixels to matplotlib linewidth points.
+    # With axis("off") + tight_layout(pad=0), axes span ~full figure width.
+    # 1 data pixel = (fig_width_inches / W) inches = (fig_width_inches * 72 / W) points
+    pts_per_px = fig.get_figwidth() * 72 / max(W, 1)
+
+    # Collect (area, patch) pairs for depth sorting
+    elements: list[tuple[float, PathPatch]] = []
+
+    # -- Closed curves: filled regions (top boundary forward, bottom backward) --
+    if scene.n_closed > 0:
+        closed_opacities = torch.sigmoid(scene.closed_opacities).detach().cpu()
+
+        # Compute first-intermediate-curve weight for boundary σ_y estimation
+        rho = scene.closed_sampler.rho
+        R_total = scene.closed_sampler.num_intermediate + 2
+        bias = scene.closed_sampler.boundary_bias
+        u1 = 1.0 / (R_total - 1)
+        w1 = 0.5 - 0.5 * math.cos(math.pi * u1 ** (1.0 / bias))
+        t_probe = torch.linspace(0, 1, 8)
+
+        for i in range(scene.n_closed):
+            opacity = closed_opacities[i].item()
+            if opacity < 0.01:
+                continue
+            bcp = scene.closed_boundary_cp[i].detach().cpu() * scale  # (2, CP, 2)
+            top = bcp[0]  # (CP, 2)
+            bot = bcp[1]
+            color = torch.sigmoid(scene.closed_colors[i]).detach().cpu().tolist()
+            num_cp = top.shape[0]
+
+            area = closed_curve_enclosed_area(bcp.unsqueeze(0))[0].item()
+
+            # Estimate boundary σ_y: distance from boundary curve to
+            # first intermediate curve, divided by ρ.  This determines
+            # how far the rendered Gaussians bleed beyond the exact boundary.
+            interp1_cp = (1 - w1) * top + w1 * bot  # (CP, 2)
+            top_pts = evaluate_bezier(top.unsqueeze(0), t_probe)[0]
+            int1_pts = evaluate_bezier(interp1_cp.unsqueeze(0), t_probe)[0]
+            cross_d = torch.sqrt(((top_pts - int1_pts) ** 2).sum(-1) + 1e-12)
+            sigma_y = (cross_d / rho).clamp(min=0.1).mean().item()
+            # Stroke expands outward by ~2σ (half the linewidth goes outward)
+            border_lw = 4 * sigma_y * pts_per_px
+
+            verts = []
+            codes = []
+
+            # Top boundary forward
+            verts.append(top[0].tolist())
+            codes.append(MplPath.MOVETO)
+            if num_cp == 4:
+                for j in range(1, 4):
+                    verts.append(top[j].tolist())
+                    codes.append(MplPath.CURVE4)
+            else:
+                for j in range(1, num_cp):
+                    verts.append(top[j].tolist())
+                    codes.append(MplPath.LINETO)
+
+            # Line to bottom end
+            verts.append(bot[-1].tolist())
+            codes.append(MplPath.LINETO)
+
+            # Bottom boundary backward
+            if num_cp == 4:
+                for j in [2, 1, 0]:
+                    verts.append(bot[j].tolist())
+                    codes.append(MplPath.CURVE4)
+            else:
+                for j in range(num_cp - 2, -1, -1):
+                    verts.append(bot[j].tolist())
+                    codes.append(MplPath.LINETO)
+
+            # CLOSEPOLY needs its own dummy vertex — don't overwrite the last CURVE4
+            verts.append([0.0, 0.0])
+            codes.append(MplPath.CLOSEPOLY)
+
+            path = MplPath(verts, codes)
+            patch = PathPatch(
+                path, facecolor=color, edgecolor=color,
+                linewidth=border_lw, alpha=opacity,
+            )
+            elements.append((area, patch))
+
+    # -- Open curves: stroked paths (3 connected cubics) --
+    if scene.n_open > 0:
+        open_opacities = torch.sigmoid(scene.open_opacities).detach().cpu()
+        mean_opacity = open_opacities.mean(dim=-1)
+        for i in range(scene.n_open):
+            opacity = mean_opacity[i].item()
+            if opacity < 0.01:
+                continue
+            cp = scene.open_control_points[i].detach().cpu() * scale  # (10, 2)
+            color = torch.sigmoid(scene.open_colors[i]).detach().cpu().tolist()
+            sw = 0.5 + torch.sigmoid(scene.open_stroke_widths[i]).detach().cpu().item() * 4.5
+
+            edge_len = torch.norm(cp[1:] - cp[:-1], dim=-1).sum().item()
+            area = edge_len * sw
+
+            verts = [cp[0].tolist()]
+            codes = [MplPath.MOVETO]
+            for seg in range(3):
+                base = seg * 3
+                for j in range(1, 4):
+                    verts.append(cp[base + j].tolist())
+                    codes.append(MplPath.CURVE4)
+
+            path = MplPath(verts, codes)
+            # Convert stroke width from data pixels to display points
+            linewidth = sw * pts_per_px
+            patch = PathPatch(
+                path, facecolor="none", edgecolor=color,
+                linewidth=linewidth, alpha=opacity, capstyle="round",
+            )
+            elements.append((area, patch))
+
+    # Draw largest-area first (background), smallest on top (foreground)
+    elements.sort(key=lambda x: x[0], reverse=True)
+    for _, patch in elements:
+        ax.add_patch(patch)
+
+    fig.tight_layout(pad=0)
+    arr = _fig_to_numpy(fig)  # closes fig
+    return _upscale_image(arr, min_size=384)
+
+
 def _fig_to_numpy(fig) -> np.ndarray:
     """Convert a matplotlib Figure to an (H, W, 3) uint8 numpy array."""
     fig.canvas.draw()
@@ -332,7 +486,7 @@ def create_inspector_app(debug_output_dir: str | Path | None = None):
     }
 
     # Default resolution
-    default_H, default_W = 256, 256
+    default_H, default_W = 64, 64
 
     with gr.Blocks(title="Bezier Splatting Inspector") as app:
         gr.Markdown("# Bezier Splatting Debug Inspector")
@@ -435,7 +589,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
 
     with gr.Row():
         resolution_slider = gr.Slider(
-            minimum=64, maximum=512, value=128, step=64,
+            minimum=64, maximum=512, value=64, step=64,
             label="Resolution (H = W)",
         )
         n_open_slider = gr.Slider(
@@ -449,6 +603,12 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         steps_slider = gr.Slider(
             minimum=200, maximum=5000, value=first_params.get("steps", 1000), step=100,
             label="Training Steps",
+        )
+
+    with gr.Row():
+        lr_scale_slider = gr.Slider(
+            minimum=0.1, maximum=10.0, value=1.0, step=0.1,
+            label="LR Scale (multiplier on all learning rates)",
         )
 
     # -- Run --
@@ -465,6 +625,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         live_rendered = gr.Image(label="Rendered (live)", type="numpy", interactive=False, height=384)
         live_error = gr.Image(label="Error Heatmap (live)", type="numpy", interactive=False, height=384)
         live_ellipses = gr.Image(label="Gaussian Ellipses", type="numpy", interactive=False, height=384)
+        live_svg = gr.Image(label="SVG Curves", type="numpy", interactive=False, height=384)
 
     live_chart = gr.Image(label="Loss / PSNR", type="numpy", interactive=False)
 
@@ -567,7 +728,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
     def run_training(
         state,
         source, sample_name, kodak_name, upload_path,
-        resolution, n_open, n_closed, steps,
+        resolution, n_open, n_closed, steps, lr_scale,
     ):
         """Generator that runs fit_image in a thread and yields live UI updates."""
         from ..metrics import compute_psnr
@@ -577,30 +738,31 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         n_open = int(n_open)
         n_closed = int(n_closed)
         steps = int(steps)
+        lr_scale = float(lr_scale)
         H = W = res
 
         # Resolve target image
         if source == "Built-in Samples":
             if sample_name not in sample_targets:
                 yield (state, "*Error: no sample selected.*", None, None, None,
-                       None, "", [], str(app_state.get("output_dir", "")))
+                       None, None, "", [], str(app_state.get("output_dir", "")))
                 return
             target = sample_targets[sample_name](res, res)
         elif source == "Kodak Samples":
             if kodak_name not in kodak_samples:
                 yield (state, "*Error: no Kodak image selected.*", None, None, None,
-                       None, "", [], str(app_state.get("output_dir", "")))
+                       None, None, "", [], str(app_state.get("output_dir", "")))
                 return
             target = load_image(kodak_samples[kodak_name], res, res)
         elif source == "Upload Image":
             if upload_path is None:
                 yield (state, "*Error: no image uploaded.*", None, None, None,
-                       None, "", [], str(app_state.get("output_dir", "")))
+                       None, None, "", [], str(app_state.get("output_dir", "")))
                 return
             target = load_image(upload_path, res, res)
         else:
             yield (state, "*Error: unknown source.*", None, None, None,
-                   None, "", [], str(app_state.get("output_dir", "")))
+                   None, None, "", [], str(app_state.get("output_dir", "")))
             return
 
         output_dir = Path(tempfile.mkdtemp(prefix="bezier_debug_"))
@@ -611,7 +773,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         result_holder: list[VectorGraphicsScene | None] = [None]
 
         display_every = max(1, steps // 40)
-        ellipse_interval = max(1, display_every * 3)
+        ellipse_interval = display_every
 
         def callback(step: int, loss: float, scene: VectorGraphicsScene) -> bool | None:
             if stop_event.is_set():
@@ -629,9 +791,16 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
                     "n_open": scene.n_open,
                     "n_closed": scene.n_closed,
                     "gaussians": None,
+                    "svg_image": None,
                 }
                 if gaussians is not None and step % ellipse_interval == 0:
                     entry["gaussians"] = _detach_gaussians(gaussians)
+
+                if step % ellipse_interval == 0:
+                    try:
+                        entry["svg_image"] = _render_curve_overlay(scene, H, W)
+                    except Exception:
+                        pass
 
                 data_queue.put(entry)
             return None
@@ -670,6 +839,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
                     n_closed=n_closed,
                     steps=steps,
                     log_every=max(1, steps // 10),
+                    lr_scale=lr_scale,
                     callback=callback,
                     debug=str(output_dir),
                 )
@@ -689,13 +859,14 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         loss_history: list[float] = []
         psnr_history: list[float] = []
         last_ellipse_np: np.ndarray | None = None
+        last_svg_np: np.ndarray | None = None
         last_rendered_np: np.ndarray | None = None
         last_error_np: np.ndarray | None = None
         last_chart_np: np.ndarray | None = None
 
         # Initial yield: show "training started" status
         yield (state, "**Training started...**", None, None, None,
-               None, "", [], str(output_dir))
+               None, None, "", [], str(output_dir))
 
         while True:
             try:
@@ -710,7 +881,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
 
             if "error" in data:
                 yield (state, f"**Error:** {data['error']}", last_rendered_np,
-                       last_error_np, last_ellipse_np, last_chart_np,
+                       last_error_np, last_ellipse_np, last_svg_np, last_chart_np,
                        "\n".join(log_lines), [], str(output_dir))
                 break
 
@@ -738,6 +909,10 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
                 ellipse_np = _fig_to_numpy(fig_ell)
                 last_ellipse_np = ellipse_np
 
+            svg_image = data.get("svg_image")
+            if svg_image is not None:
+                last_svg_np = svg_image
+
             status = (
                 f"**Step {step}/{steps}** | Loss: {loss:.5f} | "
                 f"PSNR: {psnr:.1f} dB | "
@@ -745,7 +920,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
             )
 
             yield (state, status, last_rendered_np, last_error_np,
-                   last_ellipse_np, last_chart_np,
+                   last_ellipse_np, last_svg_np, last_chart_np,
                    "\n".join(log_lines), [], str(output_dir))
 
         thread.join(timeout=30)
@@ -790,13 +965,13 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
 
             final_log = "\n".join(log_lines)
             yield (state, final_status, final_rendered_np, final_error_np,
-                   last_ellipse_np, final_chart, final_log,
+                   last_ellipse_np, last_svg_np, final_chart, final_log,
                    gallery_images, str(output_dir))
         else:
             err_msg = error_holder[0] or "Unknown error"
             yield (state, f"**Training failed:** `{err_msg}`",
                    last_rendered_np, last_error_np, last_ellipse_np,
-                   last_chart_np, "\n".join(log_lines), [], str(output_dir))
+                   last_svg_np, last_chart_np, "\n".join(log_lines), [], str(output_dir))
 
     def stop_training(state):
         """Signal the training thread to stop early."""
@@ -810,11 +985,11 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         inputs=[
             train_state,
             source_radio, sample_dropdown, kodak_dropdown, upload_image,
-            resolution_slider, n_open_slider, n_closed_slider, steps_slider,
+            resolution_slider, n_open_slider, n_closed_slider, steps_slider, lr_scale_slider,
         ],
         outputs=[
             train_state, status_text, live_rendered, live_error,
-            live_ellipses, live_chart, log_output, result_gallery, output_dir_state,
+            live_ellipses, live_svg, live_chart, log_output, result_gallery, output_dir_state,
         ],
     )
 
@@ -828,7 +1003,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
     # Generate initial preview on app load
     if sample_names:
         app.load(
-            fn=lambda: on_sample_change(sample_names[0], 128),
+            fn=lambda: on_sample_change(sample_names[0], 64),
             outputs=[preview_image, n_open_slider, n_closed_slider, steps_slider],
         )
 

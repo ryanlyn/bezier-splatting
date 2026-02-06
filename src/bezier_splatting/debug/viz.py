@@ -204,6 +204,7 @@ def render_ellipse_overlay(
     means = gaussians.means[indices].detach().cpu().numpy()
     scales = gaussians.scales[indices].detach().cpu().numpy()
     rotations = gaussians.rotations[indices].detach().cpu().float().numpy()
+    opacities = torch.sigmoid(gaussians.opacities[indices]).detach().cpu().numpy()
     curve_ids = gaussians.curve_ids[indices].detach().cpu().numpy()
 
     unique_ids = np.unique(curve_ids)
@@ -215,14 +216,15 @@ def render_ellipse_overlay(
         sx, sy = scales[i]
         angle_deg = np.degrees(rotations[i])
         color = id_to_color[curve_ids[i]]
+        alpha = float(opacities[i])
 
         ellipse = mpatches.Ellipse(
             (cx, cy),
             width=6 * sx,
             height=6 * sy,
             angle=angle_deg,
-            facecolor=(*color[:3], 0.3),
-            edgecolor=(*color[:3], 0.7),
+            facecolor=(*color[:3], 0.3 * alpha),
+            edgecolor=(*color[:3], max(0.15, 0.7 * alpha)),
             linewidth=0.5,
         )
         ax.add_patch(ellipse)
