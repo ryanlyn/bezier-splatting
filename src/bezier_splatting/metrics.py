@@ -1,20 +1,19 @@
 """Image quality metrics for reconstruction evaluation."""
 
-from __future__ import annotations
-
 import math
 
 import torch
 import torch.nn.functional as F
+from jaxtyping import Float
 from torch import Tensor
 
 
-def compute_mse(rendered: Tensor, target: Tensor) -> Tensor:
+def compute_mse(rendered: Float[Tensor, "C H W"], target: Float[Tensor, "C H W"]) -> Float[Tensor, ""]:
     """Mean squared error between rendered and target images."""
     return F.mse_loss(rendered, target)
 
 
-def compute_psnr(rendered: Tensor, target: Tensor) -> Tensor:
+def compute_psnr(rendered: Float[Tensor, "C H W"], target: Float[Tensor, "C H W"]) -> Float[Tensor, ""]:
     """Peak Signal-to-Noise Ratio in dB. Higher is better."""
     mse = compute_mse(rendered, target)
     if mse == 0:
@@ -22,14 +21,14 @@ def compute_psnr(rendered: Tensor, target: Tensor) -> Tensor:
     return 10 * torch.log10(1.0 / mse)
 
 
-def _gaussian_kernel_1d(size: int, sigma: float, device: torch.device) -> Tensor:
+def _gaussian_kernel_1d(size: int, sigma: float, device: torch.device) -> Float[Tensor, " K"]:
     """Create 1D Gaussian kernel."""
     coords = torch.arange(size, device=device, dtype=torch.float32) - size // 2
     g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
     return g / g.sum()
 
 
-def compute_ssim(rendered: Tensor, target: Tensor, window_size: int = 11) -> Tensor:
+def compute_ssim(rendered: Float[Tensor, "C H W"], target: Float[Tensor, "C H W"], window_size: int = 11) -> Float[Tensor, ""]:
     """Structural Similarity Index. Higher is better (max 1.0).
 
     Args:
@@ -73,7 +72,7 @@ def compute_ssim(rendered: Tensor, target: Tensor, window_size: int = 11) -> Ten
     return ssim_map.mean()
 
 
-def _sobel_edges(image: Tensor) -> Tensor:
+def _sobel_edges(image: Float[Tensor, "C H W"]) -> Float[Tensor, "1 H W"]:
     """Detect edges using Sobel operator. Returns edge magnitude (1, H, W)."""
     # Convert to grayscale
     if image.shape[0] == 3:
@@ -91,7 +90,7 @@ def _sobel_edges(image: Tensor) -> Tensor:
     return torch.sqrt(gx ** 2 + gy ** 2).squeeze(0)  # (1, H, W)
 
 
-def compute_edge_mse(rendered: Tensor, target: Tensor) -> Tensor:
+def compute_edge_mse(rendered: Float[Tensor, "C H W"], target: Float[Tensor, "C H W"]) -> Float[Tensor, ""]:
     """MSE computed only at Sobel-detected edge pixels of the target.
 
     Exposes boundary reconstruction failures.
@@ -110,7 +109,7 @@ def compute_edge_mse(rendered: Tensor, target: Tensor) -> Tensor:
     return masked_diff.sum() / mask.sum()
 
 
-def compute_metrics(rendered: Tensor, target: Tensor) -> dict[str, float]:
+def compute_metrics(rendered: Float[Tensor, "C H W"], target: Float[Tensor, "C H W"]) -> dict[str, float]:
     """Compute all metrics between rendered and target images.
 
     Args:

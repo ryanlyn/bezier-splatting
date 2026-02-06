@@ -6,6 +6,7 @@ Pure PyTorch reimplementation of "Bézier Splatting for Fast and Differentiable 
 
 ```bash
 uv run pytest tests/ -v --ignore=tests/test_reconstruction.py  # unit tests only (~7s)
+uv run pytest tests/ -v --typecheck --ignore=tests/test_reconstruction.py  # with shape checking
 uv run pytest tests/test_reconstruction.py --fast -v  # fast reconstruction (~6 min)
 uv run pytest tests/ -v                              # full suite (~25 min)
 uv run pytest tests/ --save-outputs                   # save diagnostic images to tests/outputs/
@@ -98,10 +99,33 @@ All norm computations use `torch.sqrt(x**2 + 1e-12)` instead of `torch.norm()` t
 5. **`closed_boundary_cp` is a read-only property**, not a parameter. It assembles from `closed_shared_pts` + `closed_interior_cp`. For optimizer param groups and pruning/densification, use the two underlying tensors directly.
 6. **After pruning, optimizer must be rebuilt** because parameters are replaced with new tensors. `fit_image` handles this with `_build_param_groups()`.
 7. **Reconstruction tests are slow.** Use `--ignore=tests/test_reconstruction.py` for fast iteration.
+8. **Never add `from __future__ import annotations`.** It stringifies annotations at parse time, breaking jaxtyping's runtime shape introspection. All source files use Python 3.11+ native syntax (`X | Y`, `list[...]`) instead.
+
+## Runtime Shape Checking (jaxtyping + beartype)
+
+Type annotations use jaxtyping shape specs (`Float[Tensor, "N 10 2"]`) checked at runtime via beartype. Activated only during unit testing via pytest import hook — zero overhead in normal usage and reconstruction tests.
+
+### Usage
+- `--typecheck` flag activates the import hook for `bezier_splatting.*`
+- Only use with unit tests, NOT reconstruction tests
+- Annotations live in source files as standard Python type hints — useful documentation regardless of checking
+
+### Dimension naming convention
+| Symbol | Meaning | Literal? |
+|--------|---------|----------|
+| `N` | curves | named |
+| `K` | samples/curve | named |
+| `G` | total Gaussians | named |
+| `H`, `W` | image dims | named |
+| `CP` | control points | named |
+| `C` | color channels | named |
+| `M1` | degree + 1 (Bernstein) | named |
+| `3`, `10`, `2` | fixed sizes | literal (enforced) |
 
 ## Changelog
 
 ### 2025-02-06
+- **Added jaxtyping + beartype runtime shape checking.** All core source files annotated with `Float[Tensor, "N K 2"]`-style shape specs. Activated via `--typecheck` pytest flag using jaxtyping's import hook — zero overhead in normal usage. Removed `from __future__ import annotations` from all files (incompatible with runtime introspection).
 - **Added `--fast` flag for reconstruction tests.** Runs only `circle` + `strokes` targets at tier-1 with halved steps (~2.5 min vs ~25 min full suite). Covers both open and closed curve samplers.
 - **Added optimization cache** to `test_reconstruction.py`. Tier-1 and tier-2 now share the same `fit_image()` run per target via `_optimization_cache` dict, halving full-suite time.
 - **Hard shared-endpoint constraint** for closed curves. Replaced single `closed_boundary_cp` parameter with `closed_shared_pts` (N, 2, 2) + `closed_interior_cp` (N, 2, num_cp-2, 2). Both boundaries now read endpoints from the same tensor — structurally impossible for them to disagree. Deleted `_enforce_shared_endpoints()` averaging. Added `closed_boundary_cp` read-only property for backward compatibility.

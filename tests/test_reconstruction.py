@@ -8,8 +8,6 @@ Thresholds are tiered:
     - Tier 2 (quality gate): PSNR > 28, SSIM > 0.85 — "good enough" reconstruction
 """
 
-from __future__ import annotations
-
 import json
 from pathlib import Path
 

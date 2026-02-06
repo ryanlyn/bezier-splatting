@@ -1,12 +1,11 @@
 """Bézier curve primitives — pure PyTorch, fully batched."""
 
-from __future__ import annotations
-
 import torch
+from jaxtyping import Float
 from torch import Tensor
 
 
-def bernstein_basis(t: Tensor, degree: int) -> Tensor:
+def bernstein_basis(t: Float[Tensor, " *batch"], degree: int) -> Float[Tensor, "*batch M1"]:
     """Evaluate Bernstein basis polynomials B_j^M(t).
 
     B_j^M(t) = C(M, j) * t^j * (1 - t)^(M - j)
@@ -34,7 +33,7 @@ def bernstein_basis(t: Tensor, degree: int) -> Tensor:
     return basis
 
 
-def evaluate_bezier(control_points: Tensor, t: Tensor) -> Tensor:
+def evaluate_bezier(control_points: Float[Tensor, "N CP 2"], t: Float[Tensor, " K"]) -> Float[Tensor, "N K 2"]:
     """Evaluate Bézier curves at parameter values t.
 
     Args:
@@ -51,7 +50,7 @@ def evaluate_bezier(control_points: Tensor, t: Tensor) -> Tensor:
     return points
 
 
-def bezier_tangent(control_points: Tensor, t: Tensor) -> Tensor:
+def bezier_tangent(control_points: Float[Tensor, "N CP 2"], t: Float[Tensor, " K"]) -> Float[Tensor, "N K 2"]:
     """Compute tangent vectors of Bézier curves at parameter values t.
 
     Uses the derivative identity: B'(t) = M * Σ B_j^{M-1}(t) * (P_{j+1} - P_j)
@@ -83,7 +82,7 @@ def composite_segment_sizes(num_samples: int) -> list[int]:
     return [base + (1 if i < remainder else 0) for i in range(3)]
 
 
-def evaluate_composite_bezier(control_points: Tensor, num_samples: int) -> tuple[Tensor, Tensor]:
+def evaluate_composite_bezier(control_points: Float[Tensor, "N 10 2"], num_samples: int) -> tuple[Float[Tensor, "N K 2"], Float[Tensor, "N K 2"]]:
     """Evaluate a composite Bézier curve (3 connected cubics sharing endpoints).
 
     The 10 control points are split into 3 segments:

@@ -4,15 +4,17 @@ Pure PyTorch implementation — no CUDA kernels. Prioritizes clarity and
 correctness over raw performance. Targets 256×256 resolution.
 """
 
-from __future__ import annotations
-
 import torch
+from jaxtyping import Float
 from torch import Tensor
 
 from .sampling import GaussianParams
 
 
-def _build_covariance(scales: Tensor, rotations: Tensor) -> Tensor:
+def _build_covariance(
+    scales: Float[Tensor, "G 2"],
+    rotations: Float[Tensor, " G"],
+) -> Float[Tensor, "G 2 2"]:
     """Build 2×2 covariance matrices from scales and rotations.
 
     Σ = R @ diag(σ²) @ R^T
@@ -47,7 +49,7 @@ def _build_covariance(scales: Tensor, rotations: Tensor) -> Tensor:
     return cov
 
 
-def _invert_2x2(cov: Tensor) -> tuple[Tensor, Tensor]:
+def _invert_2x2(cov: Float[Tensor, "G 2 2"]) -> tuple[Float[Tensor, "G 2 2"], Float[Tensor, " G"]]:
     """Analytic inverse of 2×2 symmetric positive-definite matrices.
 
     [[a, b], [b, d]]⁻¹ = (1/det) * [[d, -b], [-b, a]]
@@ -78,9 +80,9 @@ def rasterize(
     gaussians: GaussianParams,
     H: int,
     W: int,
-    bg_color: Tensor | None = None,
+    bg_color: Float[Tensor, " 3"] | None = None,
     tile_size: int = 16,
-) -> Tensor:
+) -> Float[Tensor, "3 H W"]:
     """Tile-based differentiable 2D Gaussian splatting.
 
     Algorithm:
