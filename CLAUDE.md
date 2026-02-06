@@ -5,10 +5,11 @@ Pure PyTorch reimplementation of "Bézier Splatting for Fast and Differentiable 
 ## Quick Reference
 
 ```bash
-uv run pytest tests/ -v                              # full suite (includes slow reconstruction)
-uv run pytest tests/ -v --ignore=tests/test_reconstruction.py  # fast unit tests only (~7s)
-uv run pytest tests/test_reconstruction.py -k circle  # single reconstruction target
+uv run pytest tests/ -v --ignore=tests/test_reconstruction.py  # unit tests only (~7s)
+uv run pytest tests/test_reconstruction.py --fast -v  # fast reconstruction (~2.5 min)
+uv run pytest tests/ -v                              # full suite (~25 min)
 uv run pytest tests/ --save-outputs                   # save diagnostic images to tests/outputs/
+uv run pytest tests/test_reconstruction.py -k circle  # single reconstruction target
 uv run marimo edit notebooks/vectorize.py             # interactive notebook
 ```
 
@@ -96,6 +97,10 @@ All norm computations use `torch.sqrt(x**2 + 1e-12)` instead of `torch.norm()` t
 6. **Reconstruction tests are slow.** Use `--ignore=tests/test_reconstruction.py` for fast iteration.
 
 ## Changelog
+
+### 2025-02-06
+- **Added `--fast` flag for reconstruction tests.** Runs only `circle` + `strokes` targets at tier-1 with halved steps (~2.5 min vs ~25 min full suite). Covers both open and closed curve samplers.
+- **Added optimization cache** to `test_reconstruction.py`. Tier-1 and tier-2 now share the same `fit_image()` run per target via `_optimization_cache` dict, halving full-suite time.
 
 ### 2025-02-05
 - **Reduced reconstruction test resolution** to 64×64 (was 256×256) for faster CI (~50 min vs ~5 hours). Adjusted curve counts and steps proportionally. Added `TEST_RESOLUTION` constant.

@@ -74,6 +74,9 @@ TARGET_CONFIGS = {
     },
 }
 
+# Subset for --fast mode: one closed-only, one open-only (covers both samplers)
+FAST_TARGETS = ["circle", "strokes"]
+
 
 # ── Programmatic target generation ──
 
@@ -210,6 +213,11 @@ GENERATORS = {
 }
 
 
+# ── Optimization cache ──
+# Cache fit_image() results so tier1 and tier2 share the same run per target.
+_optimization_cache: dict[str, tuple] = {}
+
+
 # ── Test fixtures ──
 
 @pytest.fixture
@@ -221,7 +229,15 @@ def save_outputs(request):
 def target_config(request):
     """Yield (target_name, target_image, config) for each test target."""
     name = request.param
-    config = TARGET_CONFIGS[name]
+    fast = request.config.getoption("--fast", default=False)
+
+    if fast and name not in FAST_TARGETS:
+        pytest.skip("skipped in --fast mode")
+
+    config = TARGET_CONFIGS[name].copy()
+    if fast:
+        config["steps"] = config["steps"] // 2
+
     target = GENERATORS[name]()
     return name, target, config
 
@@ -229,21 +245,26 @@ def target_config(request):
 # ── Tests ──
 
 class TestReconstruction:
+    def _get_optimized(self, name, target, config):
+        """Run or retrieve cached optimization for a target."""
+        if name not in _optimization_cache:
+            scene = fit_image(
+                target,
+                n_open=config["n_open"],
+                n_closed=config["n_closed"],
+                steps=config["steps"],
+                log_every=config["steps"] // 10,
+            )
+            rendered = scene(target.shape[1], target.shape[2]).detach()
+            metrics = compute_metrics(rendered, target)
+            _optimization_cache[name] = (scene, rendered, metrics)
+        return _optimization_cache[name]
+
     @pytest.mark.slow
     def test_reconstruction_tier1(self, target_config, save_outputs):
         """Tier 1: Sanity check. If this fails, something fundamental is broken."""
         name, target, config = target_config
-
-        scene = fit_image(
-            target,
-            n_open=config["n_open"],
-            n_closed=config["n_closed"],
-            steps=config["steps"],
-            log_every=config["steps"] // 10,
-        )
-
-        rendered = scene(target.shape[1], target.shape[2]).detach()
-        metrics = compute_metrics(rendered, target)
+        scene, rendered, metrics = self._get_optimized(name, target, config)
 
         if save_outputs:
             _save_diagnostics(name, target, rendered, scene, metrics)
@@ -256,20 +277,13 @@ class TestReconstruction:
         )
 
     @pytest.mark.slow
-    def test_reconstruction_tier2(self, target_config, save_outputs):
+    def test_reconstruction_tier2(self, target_config, save_outputs, request):
         """Tier 2: Quality gate. Good enough reconstruction."""
+        if request.config.getoption("--fast", default=False):
+            pytest.skip("tier-2 skipped in --fast mode")
+
         name, target, config = target_config
-
-        scene = fit_image(
-            target,
-            n_open=config["n_open"],
-            n_closed=config["n_closed"],
-            steps=config["steps"],
-            log_every=config["steps"] // 10,
-        )
-
-        rendered = scene(target.shape[1], target.shape[2]).detach()
-        metrics = compute_metrics(rendered, target)
+        scene, rendered, metrics = self._get_optimized(name, target, config)
 
         if save_outputs:
             _save_diagnostics(name, target, rendered, scene, metrics)
