@@ -39,10 +39,24 @@ def collect_gradient_stats(scene: VectorGraphicsScene) -> dict:
             all_grads.append(g.reshape(-1))
 
     if scene.n_closed > 0:
-        if scene.closed_boundary_cp.grad is not None:
-            g = scene.closed_boundary_cp.grad.detach()
-            result["closed_cp_grad"] = g.abs()
-            all_grads.append(g.reshape(-1))
+        # closed_boundary_cp is a computed property (not a leaf), so access
+        # the actual leaf parameters for gradient information.
+        shared_grad = scene.closed_shared_pts.grad
+        interior_grad = scene.closed_interior_cp.grad
+        if shared_grad is not None:
+            all_grads.append(shared_grad.detach().reshape(-1))
+        if interior_grad is not None:
+            all_grads.append(interior_grad.detach().reshape(-1))
+        if shared_grad is not None or interior_grad is not None:
+            # Reconstruct full gradient shape for downstream viz
+            bcp = scene._assemble_boundary_cp()
+            # Use autograd-free magnitude estimate from the leaf grads
+            result["closed_cp_grad"] = torch.zeros_like(bcp)
+            if shared_grad is not None:
+                result["closed_cp_grad"][:, :, 0, :] += shared_grad[:, 0, :].unsqueeze(1).abs()
+                result["closed_cp_grad"][:, :, -1, :] += shared_grad[:, 1, :].unsqueeze(1).abs()
+            if interior_grad is not None:
+                result["closed_cp_grad"][:, :, 1:-1, :] = interior_grad.detach().abs()
         if scene.closed_opacities.grad is not None:
             g = scene.closed_opacities.grad.detach()
             result["closed_opacity_grad"] = g.abs()
@@ -80,7 +94,7 @@ def collect_curve_stats(scene: VectorGraphicsScene, H: int, W: int) -> dict:
     device = (
         scene.open_control_points.device
         if scene.n_open > 0
-        else scene.closed_boundary_cp.device
+        else scene.closed_shared_pts.device
     )
 
     result: dict = {
@@ -121,7 +135,7 @@ def collect_curve_stats(scene: VectorGraphicsScene, H: int, W: int) -> dict:
 
         with torch.no_grad():
             sampler = scene.closed_sampler
-            bcp = scene._enforce_shared_endpoints()
+            bcp = scene._assemble_boundary_cp()
             gp = sampler(
                 bcp,
                 torch.sigmoid(scene.closed_colors),
