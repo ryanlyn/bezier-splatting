@@ -10,6 +10,12 @@ def pytest_addoption(parser):
         default=False,
         help="Save diagnostic images and metrics to tests/outputs/",
     )
+    parser.addoption(
+        "--fast",
+        action="store_true",
+        default=False,
+        help="Run reconstruction tests in fast mode (fewer targets, fewer steps, tier-1 only)",
+    )
 
 
 def pytest_configure(config):
