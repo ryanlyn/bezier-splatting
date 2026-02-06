@@ -97,7 +97,7 @@ def rasterize(
         H, W: Image height and width in pixels
         bg_color: Background color (3,). Defaults to white.
         tile_size: Tile size in pixels. Default 16.
-        chunk_size: Number of tiles to process in parallel per chunk. Default 32.
+        chunk_size: Number of tiles to process in parallel per chunk. Default 16.
 
     Returns:
         Rendered image (3, H, W) in [0, 1].

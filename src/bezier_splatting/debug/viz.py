@@ -20,6 +20,7 @@ import torch
 from matplotlib.figure import Figure
 from torch import Tensor
 
+from ..coords import model_to_pixel
 from ..model import VectorGraphicsScene
 from ..rasterizer import rasterize
 from ..sampling import GaussianParams
@@ -86,7 +87,7 @@ def render_gradient_heatmap(
 
     Open curves: plot the 10 CPs as connected lines, scatter colored by |grad|.
     Closed curves: plot boundary CPs similarly.
-    CPs are in [0,1] normalized space -- scale to [0, W] and [0, H] for display.
+    CPs are in [-1,1] normalized space -- scale to [0, W] and [0, H] for display.
     Uses a diverging colormap ('hot') for gradient magnitude.
     If background provided (3,H,W tensor), show it semi-transparent behind.
     """
@@ -130,8 +131,9 @@ def render_gradient_heatmap(
         cp_mag = torch.sqrt((grad_mag**2).sum(-1) + 1e-12)  # (N, 10)
 
         for i in range(scene.n_open):
-            xs = cps[i, :, 0].numpy() * W
-            ys = cps[i, :, 1].numpy() * H
+            cp_px = model_to_pixel(cps[i], H, W)  # (10, 2)
+            xs = cp_px[:, 0].numpy()
+            ys = cp_px[:, 1].numpy()
             mags = cp_mag[i].numpy()
 
             ax.plot(xs, ys, "-", color="gray", linewidth=0.5, alpha=0.5)
@@ -148,8 +150,9 @@ def render_gradient_heatmap(
 
         for i in range(scene.n_closed):
             for b in range(2):
-                xs = bcp[i, b, :, 0].numpy() * W
-                ys = bcp[i, b, :, 1].numpy() * H
+                bcp_px = model_to_pixel(bcp[i, b], H, W)  # (num_cp, 2)
+                xs = bcp_px[:, 0].numpy()
+                ys = bcp_px[:, 1].numpy()
                 mags = cp_mag[i, b].numpy()
 
                 linestyle = "-" if b == 0 else "--"

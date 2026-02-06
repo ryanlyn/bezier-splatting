@@ -1,6 +1,6 @@
 """SVG export for VectorGraphicsScene.
 
-Control points are stored in [0, 1] normalized coordinates and
+Control points are stored in [-1, 1] normalized coordinates and
 scaled to pixel space for SVG output.
 """
 
@@ -9,6 +9,7 @@ from jaxtyping import Float
 from torch import Tensor
 
 from .area import closed_curve_enclosed_area
+from .coords import model_to_pixel
 from .model import VectorGraphicsScene
 
 
@@ -26,13 +27,12 @@ def _open_curve_to_path(
     H: int,
     W: int,
 ) -> str:
-    """Convert a single open curve (10 CPs in [0,1]) to an SVG <path> element.
+    """Convert a single open curve (10 CPs in [-1,1]) to an SVG <path> element.
 
     3 connected cubic segments: CPs [0:4], [3:7], [6:10].
-    CPs are scaled from [0,1] to pixel coordinates for SVG.
+    CPs are scaled from [-1,1] to pixel coordinates for SVG.
     """
-    scale = torch.tensor([W, H], dtype=control_points.dtype)
-    cp = control_points.detach().cpu() * scale
+    cp = model_to_pixel(control_points.detach().cpu(), H, W)
 
     # Start point
     x0, y0 = cp[0].tolist()
@@ -63,14 +63,14 @@ def _closed_curve_to_path(
     H: int,
     W: int,
 ) -> str:
-    """Convert a closed curve (paired boundaries in [0,1]) to SVG filled <path>.
+    """Convert a closed curve (paired boundaries in [-1,1]) to SVG filled <path>.
 
     Draws the top boundary forward, then the bottom boundary backward, and closes.
-    CPs are scaled from [0,1] to pixel coordinates.
+    CPs are scaled from [-1,1] to pixel coordinates.
     """
-    scale = torch.tensor([W, H], dtype=boundary_cp.dtype)
-    top_cp = boundary_cp[0].detach().cpu() * scale  # (num_cp, 2)
-    bot_cp = boundary_cp[1].detach().cpu() * scale
+    bcp_px = model_to_pixel(boundary_cp.detach().cpu(), H, W)
+    top_cp = bcp_px[0]  # (num_cp, 2)
+    bot_cp = bcp_px[1]
 
     num_cp = top_cp.shape[0]
 
@@ -129,13 +129,12 @@ def scene_to_svg(scene: VectorGraphicsScene, H: int | None = None, W: int | None
     # Closed curves (usually larger → background)
     if scene.n_closed > 0:
         closed_opacities = torch.sigmoid(scene.closed_opacities).detach().cpu()
-        scale = torch.tensor([W, H], dtype=torch.float32)
         for i in range(scene.n_closed):
             opacity = closed_opacities[i].item()
             if opacity < 0.01:
                 continue
             bcp = scene.closed_boundary_cp[i]
-            bcp_px = bcp.detach().cpu() * scale
+            bcp_px = model_to_pixel(bcp.detach().cpu(), H, W)
             # True enclosed area (not bounding box)
             area = closed_curve_enclosed_area(bcp_px.unsqueeze(0))[0].item()
             svg_elem = _closed_curve_to_path(bcp, scene.closed_colors[i], opacity, H, W)
@@ -146,13 +145,12 @@ def scene_to_svg(scene: VectorGraphicsScene, H: int | None = None, W: int | None
         # Per-segment opacity → mean for SVG (SVG has no per-segment opacity)
         open_opacities = torch.sigmoid(scene.open_opacities).detach().cpu()  # (N, 3)
         mean_opacity = open_opacities.mean(dim=-1)  # (N,)
-        scale = torch.tensor([W, H], dtype=torch.float32)
         for i in range(scene.n_open):
             opacity = mean_opacity[i].item()
             if opacity < 0.01:
                 continue
             cp = scene.open_control_points[i]
-            cp_px = cp.detach().cpu() * scale
+            cp_px = model_to_pixel(cp.detach().cpu(), H, W)
             edge_len = torch.norm(cp_px[1:] - cp_px[:-1], dim=-1).sum().item()
             sw = 0.5 + torch.sigmoid(scene.open_stroke_widths[i]).item() * 4.5
             area = edge_len * sw

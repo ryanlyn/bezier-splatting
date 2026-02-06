@@ -1,6 +1,6 @@
 """Unit tests for Gaussian sampling from curves.
 
-Control points are in [0, 1] normalized coordinates.
+Control points are in [-1, 1] normalized coordinates.
 Samplers scale to pixel coords internally via H, W args.
 """
 
@@ -14,7 +14,7 @@ class TestOpenCurveSampler:
     def test_output_count(self):
         """Should produce samples_per_curve * num_curves Gaussians."""
         sampler = OpenCurveSampler(samples_per_curve=20)
-        cp = torch.rand(3, 10, 2)  # [0,1] normalized
+        cp = torch.rand(3, 10, 2) * 2 - 1  # [-1,1] normalized
         colors = torch.rand(3, 3)
         opacities = torch.zeros(3, 3)  # per-segment
         stroke_widths = torch.zeros(3)
@@ -25,7 +25,7 @@ class TestOpenCurveSampler:
     def test_output_shapes(self):
         """All output tensors should have consistent shapes."""
         sampler = OpenCurveSampler(samples_per_curve=15)
-        cp = torch.rand(2, 10, 2)  # [0,1] normalized
+        cp = torch.rand(2, 10, 2) * 2 - 1  # [-1,1] normalized
         colors = torch.rand(2, 3)
         opacities = torch.zeros(2, 3)  # per-segment
         stroke_widths = torch.zeros(2)
@@ -42,7 +42,7 @@ class TestOpenCurveSampler:
     def test_positive_scales(self):
         """Scales should be positive."""
         sampler = OpenCurveSampler(samples_per_curve=20)
-        cp = torch.rand(5, 10, 2)
+        cp = torch.rand(5, 10, 2) * 2 - 1
         g = sampler(cp, torch.rand(5, 3), torch.zeros(5, 3), torch.zeros(5), H=256, W=256)
         assert (g.scales > 0).all()
 
@@ -56,7 +56,7 @@ class TestOpenCurveSampler:
     def test_curve_ids(self):
         """Curve IDs should correctly identify which curve each Gaussian belongs to."""
         sampler = OpenCurveSampler(samples_per_curve=10)
-        cp = torch.rand(3, 10, 2)
+        cp = torch.rand(3, 10, 2) * 2 - 1
         g = sampler(cp, torch.rand(3, 3), torch.zeros(3, 3), torch.zeros(3), H=256, W=256)
 
         # Each curve should have 10 Gaussians with the same ID
@@ -67,7 +67,7 @@ class TestOpenCurveSampler:
     def test_curve_id_offset(self):
         """Curve IDs should be offset by curve_id_offset."""
         sampler = OpenCurveSampler(samples_per_curve=10)
-        cp = torch.rand(2, 10, 2)
+        cp = torch.rand(2, 10, 2) * 2 - 1
         g = sampler(cp, torch.rand(2, 3), torch.zeros(2, 3), torch.zeros(2),
                      H=256, W=256, curve_id_offset=5)
         assert g.curve_ids.min() == 5
@@ -78,7 +78,7 @@ class TestOpenCurveSampler:
         """Per-segment opacity bins must match evaluate_composite_bezier's sample distribution."""
         sampler = OpenCurveSampler(samples_per_curve=K)
         N = 1
-        cp = torch.rand(N, 10, 2)
+        cp = torch.rand(N, 10, 2) * 2 - 1
         # Use distinct opacity values per segment so we can detect misalignment
         opacities = torch.tensor([[1.0, 2.0, 3.0]])
         g = sampler(cp, torch.rand(N, 3), opacities, torch.zeros(N), H=256, W=256)
@@ -100,9 +100,9 @@ class TestOpenCurveSampler:
             k += n_seg
 
     def test_means_in_pixel_space(self):
-        """Output means should be in pixel coordinates (scaled from [0,1])."""
+        """Output means should be in pixel coordinates (scaled from [-1,1])."""
         sampler = OpenCurveSampler(samples_per_curve=10)
-        cp = torch.rand(2, 10, 2)  # [0,1]
+        cp = torch.rand(2, 10, 2) * 2 - 1  # [-1,1]
         g = sampler(cp, torch.rand(2, 3), torch.zeros(2, 3), torch.zeros(2), H=128, W=256)
         # Means should be in pixel space [0, W] × [0, H]
         assert g.means[:, 0].max() <= 256 + 1
@@ -118,7 +118,7 @@ class TestClosedCurveSampler:
         R = 8
         K = 10
         sampler = ClosedCurveSampler(num_intermediate=R, samples_per_curve=K)
-        bcp = torch.rand(2, 2, 4, 2)  # [0,1] normalized
+        bcp = torch.rand(2, 2, 4, 2) * 2 - 1  # [-1,1] normalized
         colors = torch.rand(2, 3)
         opacities = torch.zeros(2)
 
@@ -133,7 +133,7 @@ class TestClosedCurveSampler:
         R = 4
         K = 5
         sampler = ClosedCurveSampler(num_intermediate=R, samples_per_curve=K)
-        bcp = torch.rand(3, 2, 4, 2)
+        bcp = torch.rand(3, 2, 4, 2) * 2 - 1
         g = sampler(bcp, torch.rand(3, 3), torch.zeros(3), H=256, W=256)
         R_total = R + 2
         G = 3 * R_total * K
@@ -153,7 +153,7 @@ class TestClosedCurveSampler:
         R = 4
         K = 5
         sampler = ClosedCurveSampler(num_intermediate=R, samples_per_curve=K)
-        bcp = torch.rand(2, 2, 4, 2)
+        bcp = torch.rand(2, 2, 4, 2) * 2 - 1
         g = sampler(bcp, torch.rand(2, 3), torch.zeros(2), H=256, W=256)
 
         R_total = R + 2
