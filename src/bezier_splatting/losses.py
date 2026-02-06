@@ -15,9 +15,22 @@ import torch.nn.functional as F
 from jaxtyping import Float
 from torch import Tensor
 
-from .bezier import evaluate_bezier
+from .bezier import bernstein_basis
 from .metrics import compute_ssim
 from .model import VectorGraphicsScene
+
+_CURVATURE_BASIS_CACHE: dict[tuple[int, int, str, int | None, torch.dtype], Tensor] = {}
+
+
+def _cached_bernstein_basis(degree: int, samples: int, ref: Tensor) -> Tensor:
+    """Get cached Bernstein basis for a fixed degree/sample count."""
+    key = (degree, samples, ref.device.type, ref.device.index, ref.dtype)
+    cached = _CURVATURE_BASIS_CACHE.get(key)
+    if cached is None:
+        t = torch.linspace(0, 1, samples, device=ref.device, dtype=ref.dtype)
+        cached = bernstein_basis(t, degree)  # (samples, degree+1)
+        _CURVATURE_BASIS_CACHE[key] = cached
+    return cached
 
 
 @dataclass
@@ -89,14 +102,14 @@ def shape_regularizer(
     """
     n = control_points.shape[0]
     if n == 0:
-        return torch.tensor(0.0, device=control_points.device)
+        return control_points.new_zeros(())
 
     p0 = control_points[:, 0, :]  # (N, 2)
     p_end = control_points[:, -1, :]  # (N, 2)
     interior = control_points[:, 1:-1, :]  # (N, CP-2, 2)
 
     if interior.shape[1] == 0:
-        return torch.tensor(0.0, device=control_points.device)
+        return control_points.new_zeros(())
 
     v = p_end - p0  # (N, 2) chord vector
     v_sq = (v * v).sum(dim=-1, keepdim=True).unsqueeze(1)  # (N, 1, 1)
@@ -112,20 +125,20 @@ def shape_regularizer(
 
 
 def opacity_prior(
-    opacities: Float[Tensor, " N"],
+    opacities: Tensor,
 ) -> Float[Tensor, ""]:
     """Push opacities toward full visibility.
 
     Penalizes deviation of sigmoid(opacity) from 1.0.
 
     Args:
-        opacities: (N,) pre-sigmoid opacity values.
+        opacities: Pre-sigmoid opacity values, shape ``(N,)`` or ``(N, 3)``.
 
     Returns:
         Scalar loss value.
     """
     if opacities.numel() == 0:
-        return torch.tensor(0.0, device=opacities.device)
+        return opacities.new_zeros(())
 
     return (torch.sigmoid(opacities) - 1.0).abs().mean()
 
@@ -153,25 +166,25 @@ def curvature_loss(
     """
     n = boundary_cp.shape[0]
     if n == 0:
-        return torch.tensor(0.0, device=boundary_cp.device)
+        return boundary_cp.new_zeros(())
 
     num_cp = boundary_cp.shape[2]
     degree = num_cp - 1
 
-    # Sample points along both boundaries
-    t = torch.linspace(0, 1, samples_per_boundary, device=boundary_cp.device, dtype=boundary_cp.dtype)
-
-    # Boundary 0: forward direction, Boundary 1: reversed
-    b0_cp = boundary_cp[:, 0, :, :]  # (N, CP, 2)
-    b1_cp = boundary_cp[:, 1, :, :]  # (N, CP, 2)
-
-    b0_pts = evaluate_bezier(b0_cp, t)  # (N, K, 2)
-    b1_pts = evaluate_bezier(b1_cp, t)  # (N, K, 2)
+    # Sample points along both boundaries with cached basis.
+    basis = _cached_bernstein_basis(degree, samples_per_boundary, boundary_cp)  # (K, CP)
+    cp_flat = boundary_cp.reshape(n * 2, num_cp, 2)  # (2N, CP, 2)
+    pts = torch.einsum("sd,ndx->nsx", basis, cp_flat).reshape(n, 2, samples_per_boundary, 2)
+    b0_pts = pts[:, 0]  # (N, K, 2)
+    b1_pts = pts[:, 1]  # (N, K, 2)
 
     # Scale to pixel space for meaningful curvature magnitudes
-    scale = torch.tensor([W, H], device=boundary_cp.device, dtype=boundary_cp.dtype)
-    b0_pts = (b0_pts + 1) / 2 * scale
-    b1_pts = (b1_pts + 1) / 2 * scale
+    b0_pts = (b0_pts + 1) / 2
+    b1_pts = (b1_pts + 1) / 2
+    b0_pts[..., 0] = b0_pts[..., 0] * W
+    b0_pts[..., 1] = b0_pts[..., 1] * H
+    b1_pts[..., 0] = b1_pts[..., 0] * W
+    b1_pts[..., 1] = b1_pts[..., 1] * H
 
     # Concatenate: boundary 0 forward, boundary 1 reversed (closed loop)
     loop_pts = torch.cat([b0_pts, b1_pts.flip(dims=[1])], dim=1)  # (N, 2K, 2)
@@ -198,9 +211,6 @@ def curvature_loss(
     angle_mask = (cos_angle > 0.5).float()
 
     masked = curvature_mag * angle_mask
-    if angle_mask.sum() == 0:
-        return torch.tensor(0.0, device=boundary_cp.device)
-
     return masked.mean()
 
 
@@ -222,7 +232,7 @@ def boundary_joint_loss(
     """
     n, num_cp, _ = control_points.shape
     if n == 0:
-        return torch.tensor(0.0, device=control_points.device)
+        return control_points.new_zeros(())
 
     # Joint indices: every `degree` CPs (segment boundaries)
     joint_indices = list(range(0, num_cp, degree))
@@ -325,7 +335,7 @@ def xing_loss(scene: VectorGraphicsScene) -> Float[Tensor, ""]:
 
     if not losses:
         device = next(scene.parameters()).device
-        return torch.tensor(0.0, device=device)
+        return torch.zeros((), device=device)
 
     return torch.cat(losses).sum()
 
@@ -339,6 +349,7 @@ def compute_loss(
     scene: VectorGraphicsScene,
     config: LossConfig,
     step: int = 0,
+    collect_loss_dict: bool = True,
 ) -> tuple[Float[Tensor, ""], dict[str, float]]:
     """Compute all enabled loss terms and return the total.
 
@@ -348,6 +359,8 @@ def compute_loss(
         scene: The VectorGraphicsScene being optimized.
         config: Loss configuration controlling which terms are active.
         step: Current optimization step (unused for now, reserved for scheduling).
+        collect_loss_dict: When False, skip scalar extraction for logging to
+            avoid frequent device-to-host syncs in tight training loops.
 
     Returns:
         Tuple of (total_loss, loss_dict) where loss_dict maps term names
@@ -359,13 +372,15 @@ def compute_loss(
     # Reconstruction loss (always applied)
     recon = reconstruction_loss(rendered, target, config.loss_type)
     total = recon
-    loss_dict["reconstruction"] = recon.item()
+    if collect_loss_dict:
+        loss_dict["reconstruction"] = recon.item()
 
     # Xing loss
     if config.lambda_xing > 0:
         xing = xing_loss(scene)
         total = total + config.lambda_xing * xing
-        loss_dict["xing"] = xing.item()
+        if collect_loss_dict:
+            loss_dict["xing"] = xing.item()
 
     # Shape regularizer (closed curves only)
     if config.apply_shape_reg and config.lambda_shape > 0 and scene.n_closed > 0:
@@ -375,13 +390,15 @@ def compute_loss(
         b1_loss = shape_regularizer(bcp[:, 1, :, :])
         shape_loss = (b0_loss + b1_loss) / 2
         total = total + config.lambda_shape * shape_loss
-        loss_dict["shape_reg"] = shape_loss.item()
+        if collect_loss_dict:
+            loss_dict["shape_reg"] = shape_loss.item()
 
     # Opacity prior (closed curves only)
     if config.apply_opacity_prior and config.lambda_opacity_prior > 0 and scene.n_closed > 0:
         op_loss = opacity_prior(scene.closed_opacities)
         total = total + config.lambda_opacity_prior * op_loss
-        loss_dict["opacity_prior"] = op_loss.item()
+        if collect_loss_dict:
+            loss_dict["opacity_prior"] = op_loss.item()
 
     # Curvature loss (closed curves only)
     if config.apply_curvature and config.lambda_curvature > 0 and scene.n_closed > 0:
@@ -389,7 +406,8 @@ def compute_loss(
         bcp = scene.closed_boundary_cp
         curv_loss = curvature_loss(bcp, H, W)
         total = total + config.lambda_curvature * curv_loss
-        loss_dict["curvature"] = curv_loss.item()
+        if collect_loss_dict:
+            loss_dict["curvature"] = curv_loss.item()
 
     # Boundary joint loss (both curve types)
     if config.apply_boundary and config.lambda_boundary > 0:
@@ -403,8 +421,10 @@ def compute_loss(
         if joint_losses:
             bnd_loss = torch.stack(joint_losses).mean()
             total = total + config.lambda_boundary * bnd_loss
-            loss_dict["boundary_joint"] = bnd_loss.item()
+            if collect_loss_dict:
+                loss_dict["boundary_joint"] = bnd_loss.item()
 
-    loss_dict["total"] = total.item()
+    if collect_loss_dict:
+        loss_dict["total"] = total.item()
 
     return total, loss_dict

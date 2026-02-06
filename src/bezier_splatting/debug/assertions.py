@@ -91,10 +91,14 @@ def _check_dead_curves(
                 f"(opacity < {dead_threshold} for {dead_patience}+ steps)"
             )
 
-    # Closed curves: single opacity
+    # Closed curves: scalar legacy or 3-value profile
     if scene.n_closed > 0:
-        closed_op = torch.sigmoid(scene.closed_opacities).detach()  # (N,)
-        alive = closed_op >= dead_threshold
+        closed_op = torch.sigmoid(scene.closed_opacities).detach()
+        if closed_op.ndim == 2:
+            closed_alive_score = closed_op.max(dim=-1).values
+        else:
+            closed_alive_score = closed_op
+        alive = closed_alive_score >= dead_threshold
 
         key = "closed"
         if key not in dead_steps or dead_steps[key].shape[0] != scene.n_closed:

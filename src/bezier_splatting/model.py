@@ -13,7 +13,7 @@ from torch import Tensor
 
 from .area import closed_curve_enclosed_area
 from .coords import model_to_pixel
-from .rasterizer import rasterize
+from .rasterizer import RasterBackend, rasterize
 from .sampling import ClosedCurveSampler, GaussianParams, OpenCurveSampler
 
 
@@ -36,12 +36,19 @@ class VectorGraphicsScene(nn.Module):
         samples_per_open: int = 20,
         samples_per_closed_curve: int = 15,
         num_intermediate: int = 20,
+        closed_sampling_mode: str = "official_cdf",
+        raster_backend: RasterBackend = "mps",
+        raster_tile_size: int = 16,
+        raster_chunk_size: int = 16,
     ):
         super().__init__()
         self.H = H
         self.W = W
         self.n_open = n_open
         self.n_closed = n_closed
+        self.raster_backend = raster_backend
+        self.raster_tile_size = raster_tile_size
+        self.raster_chunk_size = raster_chunk_size
 
         # ── Open curve parameters (all in [-1, 1] normalized coords) ──
         if n_open > 0:
@@ -61,12 +68,13 @@ class VectorGraphicsScene(nn.Module):
             self.closed_shared_pts = nn.Parameter(shared_pts)
             self.closed_interior_cp = nn.Parameter(interior_cp)
             self.closed_colors = nn.Parameter(torch.rand(n_closed, 3))
-            self.closed_opacities = nn.Parameter(torch.zeros(n_closed))
+            # [top-boundary, interior-mid, bottom-boundary] opacity profile
+            self.closed_opacities = nn.Parameter(torch.zeros(n_closed, 3))
         else:
             self.register_buffer("closed_shared_pts", torch.empty(0, 2, 2))
             self.register_buffer("closed_interior_cp", torch.empty(0, 2, closed_cp - 2, 2))
             self.register_buffer("closed_colors", torch.empty(0, 3))
-            self.register_buffer("closed_opacities", torch.empty(0))
+            self.register_buffer("closed_opacities", torch.empty(0, 3))
 
         # ── Learned depth parameter (open curves first, then closed) ──
         total_curves = n_open + n_closed
@@ -83,7 +91,9 @@ class VectorGraphicsScene(nn.Module):
         self.closed_sampler = ClosedCurveSampler(
             num_intermediate=num_intermediate,
             samples_per_curve=samples_per_closed_curve,
+            sampling_mode=closed_sampling_mode,
         )
+        self.closed_sampling_mode = closed_sampling_mode
 
     @staticmethod
     def _init_open_cps(n: int) -> Float[Tensor, "N 10 2"]:
@@ -277,7 +287,14 @@ class VectorGraphicsScene(nn.Module):
             curve_ids=combined.curve_ids[sort_indices],
         )
 
-    def forward(self, H: int | None = None, W: int | None = None) -> Float[Tensor, "3 H W"]:
+    def forward(
+        self,
+        H: int | None = None,
+        W: int | None = None,
+        backend: RasterBackend | None = None,
+        tile_size: int | None = None,
+        chunk_size: int | None = None,
+    ) -> Float[Tensor, "3 H W"]:
         """Render the scene."""
         H = H or self.H
         W = W or self.W
@@ -287,4 +304,25 @@ class VectorGraphicsScene(nn.Module):
             device = self.open_control_points.device if self.n_open > 0 else self.closed_shared_pts.device
             return torch.ones(3, H, W, device=device)
 
-        return rasterize(gaussians, H, W)
+        return rasterize(
+            gaussians,
+            H,
+            W,
+            tile_size=self.raster_tile_size if tile_size is None else tile_size,
+            chunk_size=self.raster_chunk_size if chunk_size is None else chunk_size,
+            backend=self.raster_backend if backend is None else backend,
+        )
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """Load state dict with backward compatibility for legacy closed opacity shape.
+
+        Legacy checkpoints stored ``closed_opacities`` as shape ``(N,)``.
+        Current model expects ``(N, 3)`` profile logits.
+        """
+        if "closed_opacities" in state_dict:
+            val = state_dict["closed_opacities"]
+            if isinstance(val, Tensor) and (val.ndim == 1 or (val.ndim == 2 and val.shape[1] == 1)):
+                upgraded = val.reshape(val.shape[0], 1).expand(-1, 3).clone()
+                state_dict = dict(state_dict)
+                state_dict["closed_opacities"] = upgraded
+        return super().load_state_dict(state_dict, strict=strict)

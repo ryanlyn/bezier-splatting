@@ -162,6 +162,82 @@ class TestClosedCurveSampler:
             curve_mask = g.curve_ids == i
             assert curve_mask.sum() == expected_per_curve
 
+    def test_boundary_rows_are_first_two(self):
+        """Closed sampler output row order is [top, bottom, interiors...]."""
+        R = 3
+        K = 6
+        sampler = ClosedCurveSampler(
+            num_intermediate=R,
+            samples_per_curve=K,
+            sampling_mode="official_cdf",
+        )
+        # Top boundary near y=+0.6, bottom near y=-0.6
+        bcp = torch.tensor([[
+            [[-0.8, 0.6], [-0.2, 0.6], [0.2, 0.6], [0.8, 0.6]],
+            [[-0.8, -0.6], [-0.2, -0.6], [0.2, -0.6], [0.8, -0.6]],
+        ]], dtype=torch.float32)
+        g = sampler(bcp, torch.rand(1, 3), torch.zeros(1, 3), H=256, W=256)
+
+        rows = g.means.reshape(R + 2, K, 2)
+        row_y = rows[..., 1].mean(dim=1)
+        # Row 0 should be top boundary; row 1 should be bottom boundary.
+        assert row_y[0] > row_y[1]
+        # Interior rows should lie between the two boundaries.
+        assert ((row_y[2:] < row_y[0]) & (row_y[2:] > row_y[1])).all()
+
+    def test_legacy_scalar_closed_opacity_matches_profile(self):
+        """Legacy scalar closed opacity should match equivalent 3-value profile."""
+        R = 4
+        K = 5
+        sampler = ClosedCurveSampler(num_intermediate=R, samples_per_curve=K)
+        bcp = torch.rand(2, 2, 4, 2) * 2 - 1
+        scalar = torch.tensor([0.7, -0.3])
+        profile = scalar[:, None].expand(-1, 3).clone()
+
+        g_scalar = sampler(bcp, torch.rand(2, 3), scalar, H=128, W=128)
+        g_profile = sampler(bcp, torch.rand(2, 3), profile, H=128, W=128)
+
+        torch.testing.assert_close(g_scalar.opacities, g_profile.opacities)
+
+    def test_profile_opacity_interpolation(self):
+        """Closed opacity profile [top, mid, bottom] interpolates across interior rows."""
+        R = 4
+        K = 3
+        sampler = ClosedCurveSampler(num_intermediate=R, samples_per_curve=K)
+        bcp = torch.rand(1, 2, 4, 2) * 2 - 1
+        profile = torch.tensor([[0.0, 1.0, 2.0]])
+
+        g = sampler(bcp, torch.rand(1, 3), profile, H=64, W=64)
+        row_op = g.opacities.reshape(R + 2, K)[:, 0]  # one sample per row is enough
+
+        # Expected rows: top, bottom, then two-piece interpolation across interiors.
+        expected = torch.tensor([0.0, 2.0, 0.0, 1.0, 1.0, 2.0])
+        torch.testing.assert_close(row_op, expected)
+
+    def test_modes_produce_different_interior_layout(self):
+        """official_cdf and boundary_biased modes should differ on interior placement."""
+        R = 10
+        K = 8
+        bcp = torch.rand(1, 2, 4, 2) * 2 - 1
+        colors = torch.rand(1, 3)
+        opacities = torch.zeros(1, 3)
+
+        g_bias = ClosedCurveSampler(
+            num_intermediate=R,
+            samples_per_curve=K,
+            sampling_mode="boundary_biased",
+        )(bcp, colors, opacities, H=128, W=128)
+        g_cdf = ClosedCurveSampler(
+            num_intermediate=R,
+            samples_per_curve=K,
+            sampling_mode="official_cdf",
+        )(bcp, colors, opacities, H=128, W=128)
+
+        # Compare interior rows only (rows 2+), flattened.
+        interior_bias = g_bias.means.reshape(R + 2, K, 2)[2:]
+        interior_cdf = g_cdf.means.reshape(R + 2, K, 2)[2:]
+        assert not torch.allclose(interior_bias, interior_cdf)
+
 
 class TestGaussianParams:
     def test_concat(self):

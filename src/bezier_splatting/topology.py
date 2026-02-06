@@ -402,13 +402,18 @@ def compute_prune_mask_closed(
     outside = compute_outside_ratio(aabb, H, W)
     keep_outside = outside <= config.outside_ratio_threshold
 
-    # 2. Opacity (staged threshold)
-    closed_opacities = torch.sigmoid(scene.closed_opacities)  # (N,)
+    # 2. Opacity (staged threshold).
+    # Legacy checkpoints may provide scalar opacity; current profile uses (N, 3).
+    closed_op = torch.sigmoid(scene.closed_opacities)
+    if closed_op.ndim == 2:
+        closed_opacity_strength = closed_op.sum(dim=-1)  # official-style criterion
+    else:
+        closed_opacity_strength = closed_op
     if progress < 0.7:
         opacity_thresh = config.opacity_threshold_closed_early
     else:
         opacity_thresh = config.opacity_threshold_closed_late
-    keep_opacity = closed_opacities > opacity_thresh
+    keep_opacity = closed_opacity_strength > opacity_thresh
 
     # 3. True enclosed area
     bcp_px = model_to_pixel(bcp, H, W)
@@ -464,7 +469,7 @@ def compute_prune_mask_closed(
         metrics.append({
             "outside_ratio": outside[i].item(),
             "max_iou": max_iou[i].item(),
-            "opacity": closed_opacities[i].item(),
+            "opacity": closed_opacity_strength[i].item(),
             "area": areas[i].item(),
             "pruned": pruned,
             "reason": reason,
