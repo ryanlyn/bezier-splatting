@@ -34,7 +34,7 @@ TARGET_CONFIGS = {
     "circle": {
         "n_open": 0,
         "n_closed": 8,
-        "steps": 1000,
+        "steps": 2000,
         "tier1_psnr": 20.0,
         "tier1_ssim": 0.70,
         "tier2_psnr": 26.0,

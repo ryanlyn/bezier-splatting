@@ -1,6 +1,6 @@
 """Gaussian parameter computation from Bézier curves.
 
-Control points are stored in normalized [0, 1] coordinates and scaled to
+Control points are stored in normalized [-1, 1] coordinates and scaled to
 pixel coordinates at sampling time via (H, W) arguments.
 """
 
@@ -12,6 +12,7 @@ from jaxtyping import Float, Int
 from torch import Tensor
 
 from .bezier import evaluate_bezier, evaluate_composite_bezier, composite_segment_sizes
+from .coords import model_to_pixel
 
 
 @dataclass
@@ -59,7 +60,7 @@ class OpenCurveSampler:
     """Sample K Gaussians along each open Bézier curve (3 connected cubics).
 
     Each open curve has:
-        - 10 control points in [0, 1] normalized coords
+        - 10 control points in [-1, 1] normalized coords
         - 1 color (RGB)
         - 3 opacities (one per cubic segment, paper Appendix D)
         - 1 stroke width (scalar, learnable)
@@ -96,8 +97,7 @@ class OpenCurveSampler:
             )
 
         # Scale control points to pixel coordinates
-        scale = torch.tensor([W, H], device=device, dtype=control_points.dtype)
-        cp_px = control_points * scale
+        cp_px = model_to_pixel(control_points, H, W)
 
         # Evaluate composite curve at K points (tangents unused — central diffs below)
         points, _ = evaluate_composite_bezier(cp_px, K, compute_tangents=False)
@@ -106,11 +106,11 @@ class OpenCurveSampler:
         # Rotation from central differences of sampled points (paper Eq. 8)
         angles = _central_diff_angles(points)  # (N, K)
 
-        # σ_x: distance to next sample / rho
+        # σ_x: distance to next sample / rho + offset to prevent zero
         diffs = torch.diff(points, dim=1)  # (N, K-1, 2)
         spacings = torch.sqrt((diffs ** 2).sum(dim=-1) + 1e-12)  # (N, K-1)
         spacings = torch.cat([spacings, spacings[:, -1:]], dim=1)  # (N, K)
-        sigma_x = (spacings / self.rho).clamp(min=0.1)  # (N, K)
+        sigma_x = spacings / self.rho + 0.5  # (N, K) — offset guarantees positivity
 
         # σ_y: stroke width — sigmoid maps to [0.5, 5] pixel range
         sigma_y = 0.5 + torch.sigmoid(stroke_widths).unsqueeze(-1).expand(-1, K) * 4.5
@@ -151,7 +151,7 @@ class ClosedCurveSampler:
     Paper Eq. 4-6: R intermediate curves + 2 boundaries = R+2 total.
     Boundary curves must share start and end points.
 
-    Control points are in [0, 1] normalized coords, scaled at sample time.
+    Control points are in [-1, 1] normalized coords, scaled at sample time.
     """
 
     def __init__(
@@ -192,8 +192,7 @@ class ClosedCurveSampler:
             )
 
         # Scale CPs to pixel coordinates
-        scale = torch.tensor([W, H], device=device, dtype=boundary_cp.dtype)
-        bcp_px = boundary_cp * scale  # (N, 2, num_cp, 2)
+        bcp_px = model_to_pixel(boundary_cp, H, W)  # (N, 2, num_cp, 2)
 
         top_cp = bcp_px[:, 0]   # (N, num_cp, 2)
         bot_cp = bcp_px[:, 1]   # (N, num_cp, 2)
@@ -213,8 +212,9 @@ class ClosedCurveSampler:
 
         num_cp = boundary_cp.shape[2]
 
-        # Sample K points along each curve
-        t = torch.linspace(0, 1, K, device=device, dtype=boundary_cp.dtype)
+        # Sample K points along each curve — avoid exact endpoints where
+        # tangent direction can be degenerate and scales might be zero
+        t = torch.linspace(0.007, 0.993, K, device=device, dtype=boundary_cp.dtype)
 
         flat_cp = interp_cp.reshape(N * R_total, num_cp, 2)
         points = evaluate_bezier(flat_cp, t)    # (N*R_total, K, 2)
@@ -228,17 +228,52 @@ class ClosedCurveSampler:
         diffs_along = torch.diff(points, dim=2)  # (N, R_total, K-1, 2)
         spacings_along = torch.sqrt((diffs_along ** 2).sum(dim=-1) + 1e-12)
         spacings_along = torch.cat([spacings_along, spacings_along[..., -1:]], dim=2)
-        sigma_x = (spacings_along / self.rho).clamp(min=0.1)
+        sigma_x = spacings_along / self.rho  # (N, R_total, K)
 
         # σ_y: cross-curve spacing (distance to next curve at same k)
         # Paper Eq. 7: σ_y(r,k) = |X_{r+1,k} - X_{r,k}| / rho
         # At shared endpoints, boundaries pinch together → spacing goes to 0.
-        # Clamp to prevent degenerate covariance matrices in the rasterizer.
         diffs_cross = torch.diff(points, dim=1)  # (N, R_total-1, K, 2)
         spacings_cross = torch.sqrt((diffs_cross ** 2).sum(dim=-1) + 1e-12)  # (N, R_total-1, K)
         # Pad: last curve uses spacing to previous (not first!)
         spacings_cross = torch.cat([spacings_cross, spacings_cross[:, -1:]], dim=1)  # (N, R_total, K)
-        sigma_y = (spacings_cross / self.rho).clamp(min=0.1)
+        sigma_y = spacings_cross / self.rho  # (N, R_total, K)
+
+        # --- Mode-specific scale clamping (all non-inplace for autograd) ---
+
+        # Boundary taper: attenuate σ_x at first/last 3 samples to soften endpoints
+        if K >= 3:
+            taper = torch.tensor([0.4, 0.9, 1.0], device=device, dtype=sigma_x.dtype)
+            # Build taper mask for full K dimension: [0.4, 0.9, 1.0, ..., 1.0, ..., 1.0, 0.9, 0.4]
+            taper_full = torch.ones(K, device=device, dtype=sigma_x.dtype)
+            taper_full[:3] = taper
+            taper_full[-3:] = taper.flip(0)
+            sigma_x = sigma_x * taper_full
+
+        # Split into boundary (indices 0,1) and interior (indices 2+)
+        sx_bnd = sigma_x[:, :2, :].clamp(min=0.3)
+        sy_bnd = sigma_y[:, :2, :].clamp(min=0.75, max=1.0)
+
+        if R_total > 2:
+            sx_int = sigma_x[:, 2:, :]
+            sy_int = sigma_y[:, 2:, :]
+
+            # Ratio mutual clamp: when σ_y is very small, clamp both to 3:1 ratio
+            threshold = 0.1
+            ratio = 3.0
+            mask = sy_int < threshold
+            sx_int = torch.where(mask, torch.min(sx_int, sy_int * ratio), sx_int)
+            sy_int = torch.where(mask, torch.min(sy_int, sx_int * ratio), sy_int)
+
+            # Safety floor for interior curves
+            sx_int = sx_int.clamp(min=0.1)
+            sy_int = sy_int.clamp(min=0.1)
+
+            sigma_x = torch.cat([sx_bnd, sx_int], dim=1)
+            sigma_y = torch.cat([sy_bnd, sy_int], dim=1)
+        else:
+            sigma_x = sx_bnd
+            sigma_y = sy_bnd
 
         # Flatten: (N, R_total, K) → (N*R_total*K,)
         G = N * R_total * K
