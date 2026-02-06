@@ -6,8 +6,6 @@ tracker.log_image() or displaying in the Gradio inspector.
 Uses Agg backend for headless compatibility.
 """
 
-from __future__ import annotations
-
 import math
 from pathlib import Path
 

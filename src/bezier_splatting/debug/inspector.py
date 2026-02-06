@@ -14,8 +14,6 @@ Two launch modes:
 Requires ``gradio>=5.0.0`` (listed in the ``debug`` optional dependency group).
 """
 
-from __future__ import annotations
-
 import math
 import queue
 import re
@@ -470,6 +468,8 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
 
     live_chart = gr.Image(label="Loss / PSNR", type="numpy", interactive=False)
 
+    log_output = gr.Textbox(label="Training Log", lines=8, max_lines=20, interactive=False)
+
     # -- Final result gallery (shown after training completes) --
     result_gallery = gr.Gallery(label="Training Result", columns=3, height="auto")
 
@@ -583,24 +583,24 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         if source == "Built-in Samples":
             if sample_name not in sample_targets:
                 yield (state, "*Error: no sample selected.*", None, None, None,
-                       None, [], str(app_state.get("output_dir", "")))
+                       None, "", [], str(app_state.get("output_dir", "")))
                 return
             target = sample_targets[sample_name](res, res)
         elif source == "Kodak Samples":
             if kodak_name not in kodak_samples:
                 yield (state, "*Error: no Kodak image selected.*", None, None, None,
-                       None, [], str(app_state.get("output_dir", "")))
+                       None, "", [], str(app_state.get("output_dir", "")))
                 return
             target = load_image(kodak_samples[kodak_name], res, res)
         elif source == "Upload Image":
             if upload_path is None:
                 yield (state, "*Error: no image uploaded.*", None, None, None,
-                       None, [], str(app_state.get("output_dir", "")))
+                       None, "", [], str(app_state.get("output_dir", "")))
                 return
             target = load_image(upload_path, res, res)
         else:
             yield (state, "*Error: unknown source.*", None, None, None,
-                   None, [], str(app_state.get("output_dir", "")))
+                   None, "", [], str(app_state.get("output_dir", "")))
             return
 
         output_dir = Path(tempfile.mkdtemp(prefix="bezier_debug_"))
@@ -637,9 +637,32 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
             return None
 
         error_holder: list[str | None] = [None]
+        log_lines: list[str] = []
+
+        class _LogCapture:
+            """Tee stdout to both the original stream and a shared list.
+
+            Delegates all unknown attributes to the original stream so that
+            libraries like trackio/logging can configure formatters normally.
+            """
+            def __init__(self, original, lines):
+                self.original = original
+                self.lines = lines
+            def write(self, text):
+                self.original.write(text)
+                if text.strip():
+                    self.lines.append(text.rstrip())
+                return len(text)
+            def flush(self):
+                self.original.flush()
+            def __getattr__(self, name):
+                return getattr(self.original, name)
 
         def train_thread():
+            import sys
             import traceback
+            capture = _LogCapture(sys.stdout, log_lines)
+            sys.stdout = capture
             try:
                 result_holder[0] = fit_image(
                     target,
@@ -652,11 +675,12 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
                 )
             except Exception as e:
                 tb = traceback.format_exc()
-                print(f"[bezier-debug] Training error:\n{tb}", flush=True)
+                capture.original.write(f"[bezier-debug] Training error:\n{tb}")
                 msg = f"{type(e).__name__}: {e}"
                 error_holder[0] = msg
                 data_queue.put({"error": msg})
             finally:
+                sys.stdout = capture.original
                 data_queue.put(None)
 
         thread = threading.Thread(target=train_thread, daemon=True)
@@ -671,7 +695,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
 
         # Initial yield: show "training started" status
         yield (state, "**Training started...**", None, None, None,
-               None, [], str(output_dir))
+               None, "", [], str(output_dir))
 
         while True:
             try:
@@ -686,8 +710,8 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
 
             if "error" in data:
                 yield (state, f"**Error:** {data['error']}", last_rendered_np,
-                       last_error_np, last_ellipse_np, last_chart_np, [],
-                       str(output_dir))
+                       last_error_np, last_ellipse_np, last_chart_np,
+                       "\n".join(log_lines), [], str(output_dir))
                 break
 
             step = data["step"]
@@ -721,7 +745,8 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
             )
 
             yield (state, status, last_rendered_np, last_error_np,
-                   last_ellipse_np, last_chart_np, [], str(output_dir))
+                   last_ellipse_np, last_chart_np,
+                   "\n".join(log_lines), [], str(output_dir))
 
         thread.join(timeout=30)
 
@@ -763,13 +788,15 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
                 f"Results saved to `{output_dir}`"
             )
 
+            final_log = "\n".join(log_lines)
             yield (state, final_status, final_rendered_np, final_error_np,
-                   last_ellipse_np, final_chart, gallery_images, str(output_dir))
+                   last_ellipse_np, final_chart, final_log,
+                   gallery_images, str(output_dir))
         else:
             err_msg = error_holder[0] or "Unknown error"
             yield (state, f"**Training failed:** `{err_msg}`",
                    last_rendered_np, last_error_np, last_ellipse_np,
-                   last_chart_np, [], str(output_dir))
+                   last_chart_np, "\n".join(log_lines), [], str(output_dir))
 
     def stop_training(state):
         """Signal the training thread to stop early."""
@@ -787,7 +814,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         ],
         outputs=[
             train_state, status_text, live_rendered, live_error,
-            live_ellipses, live_chart, result_gallery, output_dir_state,
+            live_ellipses, live_chart, log_output, result_gallery, output_dir_state,
         ],
     )
 

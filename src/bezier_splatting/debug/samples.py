@@ -4,8 +4,6 @@ Provides programmatic targets (circle, overlap, strokes, gradient, composition),
 external image loading, and Kodak sample image discovery.
 """
 
-from __future__ import annotations
-
 import math
 from collections.abc import Callable
 from pathlib import Path

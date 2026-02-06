@@ -4,8 +4,6 @@ Wraps trackio for scalar metrics. Falls back gracefully when trackio
 is not installed (images and snapshots still save to disk).
 """
 
-from __future__ import annotations
-
 from pathlib import Path
 
 import torch

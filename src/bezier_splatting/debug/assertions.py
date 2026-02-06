@@ -4,8 +4,6 @@ Detects NaN/Inf parameters, dead curves, and scale collapse early
 so the user can diagnose divergence before it ruins a long run.
 """
 
-from __future__ import annotations
-
 import torch
 
 from ..model import VectorGraphicsScene
