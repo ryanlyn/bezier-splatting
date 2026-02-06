@@ -20,7 +20,7 @@ uv run marimo edit notebooks/vectorize.py             # interactive notebook
 src/bezier_splatting/
 ├── bezier.py        # Pure Bézier math (evaluate, tangent, Bernstein basis)
 ├── sampling.py      # Curve → GaussianParams conversion (open + closed samplers)
-├── rasterizer.py    # Tile-based 2D Gaussian splatting (front-to-back alpha compositing)
+├── rasterizer.py    # Chunked batched tile rendering for 2D Gaussian splatting (front-to-back alpha compositing)
 ├── model.py         # VectorGraphicsScene (nn.Module combining all primitives)
 ├── optimization.py  # Training loop + LIVE Xing loss + pruning/densification
 ├── area.py          # True enclosed area for closed curves (depth sorting)
@@ -51,6 +51,9 @@ Depth is per-curve, not per-Gaussian. All Gaussians from the same curve share a 
 
 ### Scale clamping
 Both samplers clamp σ_x and σ_y to `min=0.1` pixels. Without this, shared endpoints where boundaries pinch together produce near-zero scales → degenerate covariance matrices → NaN gradients during backward pass.
+
+### Chunked tile rendering
+The rasterizer processes tiles in chunks rather than individually. Tiles are sorted by Gaussian count (ascending) and processed in groups of `chunk_size` (default 16). Within each chunk, tiles are padded to the chunk-local max Gaussian count, enabling batched einsum/cumprod/compositing. Padding entries have zeroed opacity so they don't contribute. Sensitivity analysis shows a U-shaped curve: chunk_size=1 has too much Python loop overhead, chunk_size=256 has too much memory pressure from intermediate tensors. Sweet spot is 8-16 tiles per chunk.
 
 ### Safe norms
 All norm computations use `torch.sqrt(x**2 + 1e-12)` instead of `torch.norm()` to prevent NaN gradients at zero vectors.
@@ -100,6 +103,7 @@ All norm computations use `torch.sqrt(x**2 + 1e-12)` instead of `torch.norm()` t
 6. **After pruning, optimizer must be rebuilt** because parameters are replaced with new tensors. `fit_image` handles this with `_build_param_groups()`.
 7. **Reconstruction tests are slow.** Use `--ignore=tests/test_reconstruction.py` for fast iteration.
 8. **Never add `from __future__ import annotations`.** It stringifies annotations at parse time, breaking jaxtyping's runtime shape introspection. All source files use Python 3.11+ native syntax (`X | Y`, `list[...]`) instead.
+9. **Chunk size sensitivity.** The rasterizer's `chunk_size` default (16) was chosen via sensitivity analysis. Too small = Python loop overhead; too large = memory pressure from padded intermediate tensors. The optimal value shifts slightly lower for denser scenes.
 
 ## Runtime Shape Checking (jaxtyping + beartype)
 
@@ -123,6 +127,11 @@ Type annotations use jaxtyping shape specs (`Float[Tensor, "N 10 2"]`) checked a
 | `3`, `10`, `2` | fixed sizes | literal (enforced) |
 
 ## Changelog
+
+### 2026-02-06
+- **Vectorized rasterizer tile loop.** Replaced Python triple-loop tile assignment (4× CPU-GPU syncs) with GPU-side boolean overlap matrix. Replaced per-tile rendering loop (256 iterations) with chunked batched rendering — tiles sorted by Gaussian count, processed in chunks of 16 with padded gather + batched einsum/cumprod. Pre-built pixel grid eliminates per-tile allocation. ~1.5× speedup on forward+backward (308→205 ms at 256×256 with 20 open + 5 closed curves).
+- **Detached depth sorting from autograd.** Wrapped area computation + argsort in `torch.no_grad()` since areas only feed discrete sort indices. Gaussian reordering stays outside the block to preserve gradient flow.
+- **Sampling quick wins.** Added `compute_tangents=False` to `evaluate_composite_bezier` (skips 3× unused `bezier_tangent` calls). Cached Bernstein binomial coefficients for degrees 1-3 in `_BINOM_COEFFS`. Deferred `loss.item()` to logging/callback steps only.
 
 ### 2025-02-06
 - **Added jaxtyping + beartype runtime shape checking.** All core source files annotated with `Float[Tensor, "N K 2"]`-style shape specs. Activated via `--typecheck` pytest flag using jaxtyping's import hook — zero overhead in normal usage. Removed `from __future__ import annotations` from all files (incompatible with runtime introspection).
