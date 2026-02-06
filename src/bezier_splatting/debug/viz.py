@@ -26,6 +26,48 @@ from ..rasterizer import rasterize
 from ..sampling import GaussianParams
 
 
+def _infer_closed_cp(state: dict[str, Tensor], fallback: int = 4) -> int:
+    """Infer closed curve control-point count from serialized tensors."""
+    interior = state.get("closed_interior_cp")
+    if interior is not None and interior.ndim == 4:
+        return int(interior.shape[2] + 2)
+    return fallback
+
+
+def _infer_curve_counts(state: dict[str, Tensor], n_open: int | None, n_closed: int | None) -> tuple[int, int]:
+    """Infer n_open/n_closed when metadata is absent or stale."""
+    open_cp = state.get("open_control_points")
+    inferred_open = int(open_cp.shape[0]) if open_cp is not None else 0
+    if n_open is None or (open_cp is not None and int(n_open) != inferred_open):
+        n_open = inferred_open
+
+    if "closed_shared_pts" in state:
+        inferred_closed = int(state["closed_shared_pts"].shape[0])
+    elif "closed_interior_cp" in state:
+        inferred_closed = int(state["closed_interior_cp"].shape[0])
+    else:
+        inferred_closed = 0
+    if n_closed is None or int(n_closed) != inferred_closed:
+        n_closed = inferred_closed
+    return int(n_open), int(n_closed)
+
+
+def _scene_from_state(
+    raw_state: dict[str, Tensor],
+    n_open: int | None = None,
+    n_closed: int | None = None,
+    num_cp_closed_hint: int = 4,
+) -> VectorGraphicsScene:
+    """Reconstruct a scene from serialized state tensors."""
+    state = dict(raw_state)
+    n_open, n_closed = _infer_curve_counts(state, n_open, n_closed)
+    num_cp_closed = _infer_closed_cp(state, fallback=num_cp_closed_hint)
+
+    scene = VectorGraphicsScene(n_open=n_open, n_closed=n_closed, closed_cp=num_cp_closed)
+    scene.load_state_dict(state, strict=False)
+    return scene
+
+
 def _tensor_to_numpy_image(tensor: Tensor) -> np.ndarray:
     """Convert a (3, H, W) or (H, W, 3) tensor in [0,1] to (H, W, 3) uint8 numpy."""
     t = tensor.detach().cpu().float()
@@ -39,41 +81,24 @@ def _scene_from_snapshot(snapshot: dict) -> VectorGraphicsScene:
 
     The snapshot contains all parameter/buffer tensors plus n_open, n_closed metadata.
     """
-    n_open = snapshot["n_open"]
-    n_closed = snapshot["n_closed"]
-
-    # Infer num_cp_closed from closed_boundary_cp shape
-    if "closed_boundary_cp" in snapshot and snapshot["closed_boundary_cp"].numel() > 0:
-        num_cp_closed = snapshot["closed_boundary_cp"].shape[2]
-    else:
-        num_cp_closed = 4
-
-    scene = VectorGraphicsScene(n_open=n_open, n_closed=n_closed, closed_cp=num_cp_closed)
-
-    # Load state by assigning tensors from snapshot
-    state = {}
-    for key, val in snapshot.items():
-        if isinstance(val, Tensor):
-            state[key] = val
-    scene.load_state_dict(state, strict=False)
-    return scene
+    n_open = snapshot.get("n_open")
+    n_closed = snapshot.get("n_closed")
+    state = {key: val for key, val in snapshot.items() if isinstance(val, Tensor)}
+    return _scene_from_state(state, n_open=n_open, n_closed=n_closed)
 
 
 def _scene_from_checkpoint(ckpt: dict) -> VectorGraphicsScene:
     """Reconstruct a VectorGraphicsScene from a checkpoint payload dict."""
-    n_open = ckpt.get("n_open", 0)
-    n_closed = ckpt.get("n_closed", 0)
+    n_open = ckpt.get("n_open")
+    n_closed = ckpt.get("n_closed")
     state_dict = ckpt["state_dict"]
-
-    # Infer num_cp_closed from state_dict
-    if "closed_boundary_cp" in state_dict and state_dict["closed_boundary_cp"].numel() > 0:
-        num_cp_closed = state_dict["closed_boundary_cp"].shape[2]
-    else:
-        num_cp_closed = ckpt.get("num_cp_closed", 4)
-
-    scene = VectorGraphicsScene(n_open=n_open, n_closed=n_closed, closed_cp=num_cp_closed)
-    scene.load_state_dict(state_dict, strict=False)
-    return scene
+    num_cp_closed = int(ckpt.get("num_cp_closed", 4))
+    return _scene_from_state(
+        state_dict,
+        n_open=n_open,
+        n_closed=n_closed,
+        num_cp_closed_hint=num_cp_closed,
+    )
 
 
 def render_gradient_heatmap(
@@ -123,6 +148,8 @@ def render_gradient_heatmap(
         vmax = 1.0
     cmap = plt.cm.hot
 
+    sc = None
+
     # Open curves
     if open_cp_grad is not None and scene.n_open > 0:
         cps = scene.open_control_points.detach().cpu()  # (N, 10, 2)
@@ -162,7 +189,8 @@ def render_gradient_heatmap(
                     s=20, edgecolors="k", linewidths=0.3, zorder=3,
                 )
 
-    fig.colorbar(sc, ax=ax, label="|grad|")
+    if sc is not None:
+        fig.colorbar(sc, ax=ax, label="|grad|")
     ax.set_title("Control Point Gradient Magnitudes")
     fig.tight_layout()
     return fig

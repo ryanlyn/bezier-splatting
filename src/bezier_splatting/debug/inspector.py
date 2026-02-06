@@ -35,6 +35,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from ..coords import model_to_pixel
 from ..model import VectorGraphicsScene
 from ..rasterizer import _build_covariance, _invert_2x2, rasterize
 from ..sampling import GaussianParams
@@ -130,8 +131,6 @@ def _render_curve_overlay(scene: VectorGraphicsScene, H: int, W: int) -> np.ndar
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
 
-    scale = torch.tensor([W, H], dtype=torch.float32)
-
     # Convert data-space pixels to matplotlib linewidth points.
     # With axis("off") + tight_layout(pad=0), axes span ~full figure width.
     # 1 data pixel = (fig_width_inches / W) inches = (fig_width_inches * 72 / W) points
@@ -156,7 +155,8 @@ def _render_curve_overlay(scene: VectorGraphicsScene, H: int, W: int) -> np.ndar
             opacity = closed_opacities[i].item()
             if opacity < 0.01:
                 continue
-            bcp = scene.closed_boundary_cp[i].detach().cpu() * scale  # (2, CP, 2)
+            bcp_model = scene.closed_boundary_cp[i].detach().cpu()  # (2, CP, 2) in [-1, 1]
+            bcp = model_to_pixel(bcp_model, H, W)  # (2, CP, 2) in pixel coords
             top = bcp[0]  # (CP, 2)
             bot = bcp[1]
             color = torch.sigmoid(scene.closed_colors[i]).detach().cpu().tolist()
@@ -223,7 +223,7 @@ def _render_curve_overlay(scene: VectorGraphicsScene, H: int, W: int) -> np.ndar
             opacity = mean_opacity[i].item()
             if opacity < 0.01:
                 continue
-            cp = scene.open_control_points[i].detach().cpu() * scale  # (10, 2)
+            cp = model_to_pixel(scene.open_control_points[i].detach().cpu(), H, W)  # (10, 2)
             color = torch.sigmoid(scene.open_colors[i]).detach().cpu().tolist()
             sw = 0.5 + torch.sigmoid(scene.open_stroke_widths[i]).detach().cpu().item() * 4.5
 
@@ -275,7 +275,8 @@ def _render_scene_image(scene: VectorGraphicsScene, H: int, W: int) -> np.ndarra
 
 def _tensor_to_display(t: Tensor, min_size: int = 0) -> np.ndarray:
     """Convert a (3, H, W) float tensor in [0, 1] to (H, W, 3) uint8 numpy for Gradio."""
-    img = (t.permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8)
+    t_cpu = t.detach().cpu()
+    img = (t_cpu.permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8)
     if min_size > 0:
         img = _upscale_image(img, min_size)
     return img
@@ -299,7 +300,7 @@ def _compute_error_map(rendered: Tensor, target: Tensor) -> np.ndarray:
     """Compute a colorized L1 error heatmap as (H, W, 3) uint8 numpy."""
     import matplotlib.cm as cm
 
-    error = (rendered - target).abs().mean(dim=0).numpy()  # (H, W)
+    error = (rendered.detach().cpu() - target.detach().cpu()).abs().mean(dim=0).numpy()  # (H, W)
     error_max = error.max()
     if error_max > 0:
         error_norm = error / error_max
@@ -451,6 +452,19 @@ def _scan_output_dir(output_dir: Path | None) -> dict:
         "step_min": step_min,
         "step_max": step_max,
     }
+
+
+def _resolve_scan_context(app_state: dict, output_dir_str: str | None) -> tuple[Path | None, dict]:
+    """Resolve output dir + scanned artifacts from either UI state or shared app state."""
+    normalized = str(output_dir_str).strip() if output_dir_str is not None else ""
+    if normalized and normalized.lower() != "none":
+        output_dir = Path(output_dir_str)
+        return output_dir, _scan_output_dir(output_dir)
+    output_dir = app_state.get("output_dir")
+    cached = app_state.get("scan")
+    if cached is None:
+        cached = _scan_output_dir(output_dir)
+    return output_dir, cached
 
 
 # ---------------------------------------------------------------------------
@@ -740,29 +754,30 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         steps = int(steps)
         lr_scale = float(lr_scale)
         H = W = res
+        current_output = str(app_state["output_dir"]) if app_state.get("output_dir") is not None else None
 
         # Resolve target image
         if source == "Built-in Samples":
             if sample_name not in sample_targets:
                 yield (state, "*Error: no sample selected.*", None, None, None,
-                       None, None, "", [], str(app_state.get("output_dir", "")))
+                       None, None, "", [], current_output)
                 return
             target = sample_targets[sample_name](res, res)
         elif source == "Kodak Samples":
             if kodak_name not in kodak_samples:
                 yield (state, "*Error: no Kodak image selected.*", None, None, None,
-                       None, None, "", [], str(app_state.get("output_dir", "")))
+                       None, None, "", [], current_output)
                 return
             target = load_image(kodak_samples[kodak_name], res, res)
         elif source == "Upload Image":
             if upload_path is None:
                 yield (state, "*Error: no image uploaded.*", None, None, None,
-                       None, None, "", [], str(app_state.get("output_dir", "")))
+                       None, None, "", [], current_output)
                 return
             target = load_image(upload_path, res, res)
         else:
             yield (state, "*Error: unknown source.*", None, None, None,
-                   None, None, "", [], str(app_state.get("output_dir", "")))
+                   None, None, "", [], current_output)
             return
 
         output_dir = Path(tempfile.mkdtemp(prefix="bezier_debug_"))
@@ -1018,12 +1033,7 @@ def _build_training_overview_tab(gr, app_state, render_h, render_w, output_dir_s
         H, W = int(H), int(W)
 
         # Re-scan in case training just completed
-        if output_dir_str:
-            output_dir = Path(output_dir_str)
-            scan = _scan_output_dir(output_dir)
-        else:
-            scan = app_state["scan"]
-            output_dir = app_state.get("output_dir")
+        output_dir, scan = _resolve_scan_context(app_state, output_dir_str)
 
         ckpt_list = scan["ckpt_list"]
         if not ckpt_list and output_dir is None:
@@ -1122,11 +1132,7 @@ def _build_checkpoint_explorer_tab(gr, app_state, render_h, render_w, output_dir
         H, W = int(H), int(W)
         step_val = int(float(step_val))
 
-        if output_dir_str:
-            output_dir = Path(output_dir_str)
-            scan = _scan_output_dir(output_dir)
-        else:
-            scan = app_state["scan"]
+        _output_dir, scan = _resolve_scan_context(app_state, output_dir_str)
 
         ckpt_list = scan["ckpt_list"]
         grad_snaps = scan["grad_snaps"]
@@ -1221,11 +1227,7 @@ def _build_pixel_inspector_tab(gr, app_state, render_h, render_w, output_dir_sta
         H, W = int(H), int(W)
         step_val = int(float(step_val))
 
-        if output_dir_str:
-            output_dir = Path(output_dir_str)
-            scan = _scan_output_dir(output_dir)
-        else:
-            scan = app_state["scan"]
+        _output_dir, scan = _resolve_scan_context(app_state, output_dir_str)
 
         ckpt_list = scan["ckpt_list"]
         if not ckpt_list:
@@ -1311,7 +1313,11 @@ def _build_pixel_inspector_tab(gr, app_state, render_h, render_w, output_dir_sta
     )
 
     def on_image_select(state, H, W, evt: _GrSelectData):
-        x, y = evt.index
+        if evt is None or evt.index is None:
+            return 0, 0, [], None
+        if not isinstance(evt.index, (tuple, list)) or len(evt.index) < 2:
+            return 0, 0, [], None
+        x, y = evt.index[0], evt.index[1]
         rows, overlay = inspect_pixel(x, y, state, int(H), int(W))
         return x, y, rows, overlay
 
@@ -1343,11 +1349,7 @@ def _build_pruning_tab(gr, app_state, render_h, render_w, output_dir_state):
         H, W = int(H), int(W)
         step = int(float(step_val))
 
-        if output_dir_str:
-            output_dir = Path(output_dir_str)
-            scan = _scan_output_dir(output_dir)
-        else:
-            scan = app_state["scan"]
+        _output_dir, scan = _resolve_scan_context(app_state, output_dir_str)
 
         prune_before = scan["prune_before_snaps"]
         prune_after = scan["prune_after_snaps"]

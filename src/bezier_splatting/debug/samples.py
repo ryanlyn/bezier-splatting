@@ -178,7 +178,7 @@ def load_image(path: str | Path, H: int = 256, W: int = 256) -> Tensor:
     # Convert RGBA to RGB (composite onto white)
     if img.mode == "RGBA":
         background = Image.new("RGB", img.size, (255, 255, 255))
-        background.paste(img, mask=img.split()[[-1]])
+        background.paste(img, mask=img.split()[-1])
         img = background
     elif img.mode == "LA" or img.mode == "P":
         img = img.convert("RGBA")

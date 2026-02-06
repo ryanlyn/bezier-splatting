@@ -29,6 +29,7 @@ def save_checkpoint(
         "metrics": metrics,
         "n_open": scene.n_open,
         "n_closed": scene.n_closed,
+        "num_cp_closed": int(scene.closed_interior_cp.shape[2] + 2),
     }
     torch.save(payload, path)
     return path
