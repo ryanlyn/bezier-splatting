@@ -27,6 +27,11 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+try:
+    from gradio import SelectData as _GrSelectData
+except ImportError:
+    _GrSelectData = None
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -116,9 +121,26 @@ def _render_scene_image(scene: VectorGraphicsScene, H: int, W: int) -> np.ndarra
     return (_tensor_to_numpy_image(rendered) * 255).astype(np.uint8)
 
 
-def _tensor_to_display(t: Tensor) -> np.ndarray:
+def _tensor_to_display(t: Tensor, min_size: int = 0) -> np.ndarray:
     """Convert a (3, H, W) float tensor in [0, 1] to (H, W, 3) uint8 numpy for Gradio."""
-    return (t.permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8)
+    img = (t.permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8)
+    if min_size > 0:
+        img = _upscale_image(img, min_size)
+    return img
+
+
+def _upscale_image(img: np.ndarray, min_size: int = 384) -> np.ndarray:
+    """Upscale a small image so it displays well in Gradio panels."""
+    from PIL import Image as PILImage
+
+    h, w = img.shape[:2]
+    if h >= min_size and w >= min_size:
+        return img
+    scale = max(min_size / h, min_size / w)
+    new_h, new_w = int(h * scale), int(w * scale)
+    pil = PILImage.fromarray(img)
+    pil = pil.resize((new_w, new_h), PILImage.NEAREST)
+    return np.array(pil)
 
 
 def _compute_error_map(rendered: Tensor, target: Tensor) -> np.ndarray:
@@ -159,11 +181,7 @@ def _make_loss_chart(
     ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    fig.canvas.draw()
-    data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    plt.close(fig)
-    return data.copy()
+    return _fig_to_numpy(fig)
 
 
 def _detach_gaussians(g: GaussianParams) -> GaussianParams:
@@ -318,7 +336,7 @@ def create_inspector_app(debug_output_dir: str | Path | None = None):
     # Default resolution
     default_H, default_W = 256, 256
 
-    with gr.Blocks(title="Bezier Splatting Inspector", theme=gr.themes.Soft()) as app:
+    with gr.Blocks(title="Bezier Splatting Inspector") as app:
         gr.Markdown("# Bezier Splatting Debug Inspector")
 
         if output_dir is not None:
@@ -335,7 +353,7 @@ def create_inspector_app(debug_output_dir: str | Path | None = None):
         # Tab 0: Train
         # ================================================================
         with gr.Tab("Train"):
-            _build_train_tab(gr, app_state, render_h, render_w, output_dir_state)
+            _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state)
 
         # ================================================================
         # Tab 1: Training Overview
@@ -369,7 +387,7 @@ def create_inspector_app(debug_output_dir: str | Path | None = None):
 # ---------------------------------------------------------------------------
 
 
-def _build_train_tab(gr, app_state, render_h, render_w, output_dir_state):
+def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
     """Tab 0: Image selection, parameters, live training visualization."""
 
     sample_targets = get_sample_targets()
@@ -440,15 +458,15 @@ def _build_train_tab(gr, app_state, render_h, render_w, output_dir_state):
 
     with gr.Row():
         train_btn = gr.Button("Start Training", variant="primary", size="lg")
-        stop_btn = gr.Button("Stop Training", variant="stop", size="lg", interactive=False)
+        stop_btn = gr.Button("Stop Training", variant="stop", size="lg")
 
     status_text = gr.Markdown("*Ready to train.*")
 
     # -- Live visualization panels --
-    with gr.Row():
-        live_rendered = gr.Image(label="Rendered (live)", type="numpy", interactive=False)
-        live_error = gr.Image(label="Error Heatmap (live)", type="numpy", interactive=False)
-        live_ellipses = gr.Image(label="Gaussian Ellipses", type="numpy", interactive=False)
+    with gr.Row(equal_height=True):
+        live_rendered = gr.Image(label="Rendered (live)", type="numpy", interactive=False, height=384)
+        live_error = gr.Image(label="Error Heatmap (live)", type="numpy", interactive=False, height=384)
+        live_ellipses = gr.Image(label="Gaussian Ellipses", type="numpy", interactive=False, height=384)
 
     live_chart = gr.Image(label="Loss / PSNR", type="numpy", interactive=False)
 
@@ -618,7 +636,10 @@ def _build_train_tab(gr, app_state, render_h, render_w, output_dir_state):
                 data_queue.put(entry)
             return None
 
+        error_holder: list[str | None] = [None]
+
         def train_thread():
+            import traceback
             try:
                 result_holder[0] = fit_image(
                     target,
@@ -630,7 +651,11 @@ def _build_train_tab(gr, app_state, render_h, render_w, output_dir_state):
                     debug=str(output_dir),
                 )
             except Exception as e:
-                data_queue.put({"error": str(e)})
+                tb = traceback.format_exc()
+                print(f"[bezier-debug] Training error:\n{tb}", flush=True)
+                msg = f"{type(e).__name__}: {e}"
+                error_holder[0] = msg
+                data_queue.put({"error": msg})
             finally:
                 data_queue.put(None)
 
@@ -669,8 +694,8 @@ def _build_train_tab(gr, app_state, render_h, render_w, output_dir_state):
             loss = data["loss"]
             rendered_cpu = data["rendered"]
 
-            rendered_np = _tensor_to_display(rendered_cpu)
-            error_np = _compute_error_map(rendered_cpu, target)
+            rendered_np = _tensor_to_display(rendered_cpu, min_size=384)
+            error_np = _upscale_image(_compute_error_map(rendered_cpu, target), min_size=384)
             last_rendered_np = rendered_np
             last_error_np = error_np
 
@@ -707,8 +732,8 @@ def _build_train_tab(gr, app_state, render_h, render_w, output_dir_state):
                 final_rendered = scene(H, W)
                 final_psnr = compute_psnr(final_rendered, target).item()
 
-            final_rendered_np = _tensor_to_display(final_rendered)
-            final_error_np = _compute_error_map(final_rendered.cpu(), target)
+            final_rendered_np = _tensor_to_display(final_rendered, min_size=384)
+            final_error_np = _upscale_image(_compute_error_map(final_rendered.cpu(), target), min_size=384)
 
             if loss_history:
                 final_chart = _make_loss_chart(
@@ -741,7 +766,8 @@ def _build_train_tab(gr, app_state, render_h, render_w, output_dir_state):
             yield (state, final_status, final_rendered_np, final_error_np,
                    last_ellipse_np, final_chart, gallery_images, str(output_dir))
         else:
-            yield (state, "**Training failed.** Check logs for details.",
+            err_msg = error_holder[0] or "Unknown error"
+            yield (state, f"**Training failed:** `{err_msg}`",
                    last_rendered_np, last_error_np, last_ellipse_np,
                    last_chart_np, [], str(output_dir))
 
@@ -752,7 +778,7 @@ def _build_train_tab(gr, app_state, render_h, render_w, output_dir_state):
             event.set()
         return state, "**Stopping training...**"
 
-    train_btn.click(
+    train_event = train_btn.click(
         fn=run_training,
         inputs=[
             train_state,
@@ -769,6 +795,7 @@ def _build_train_tab(gr, app_state, render_h, render_w, output_dir_state):
         fn=stop_training,
         inputs=[train_state],
         outputs=[train_state, status_text],
+        cancels=[train_event],
     )
 
     # Generate initial preview on app load
@@ -1081,9 +1108,9 @@ def _build_pixel_inspector_tab(gr, app_state, render_h, render_w, output_dir_sta
         outputs=[clickable_image, scene_state],
     )
 
-    def on_image_select(evt: gr.SelectData, state, H, W):
+    def on_image_select(state, H, W, evt: _GrSelectData):
         x, y = evt.index
-        rows, overlay = inspect_pixel(x, y, state, H, W)
+        rows, overlay = inspect_pixel(x, y, state, int(H), int(W))
         return x, y, rows, overlay
 
     clickable_image.select(
@@ -1175,8 +1202,10 @@ def launch_inspector(debug_output_dir: str | Path | None = None, **kwargs):
         debug_output_dir: Path to existing debug output, or None to start fresh.
         **kwargs: Extra arguments passed to ``gr.Blocks.launch()``.
     """
+    import gradio
     app = create_inspector_app(debug_output_dir)
-    app.launch(**kwargs)
+    kwargs.setdefault("prevent_thread_lock", False)
+    app.launch(theme=gradio.themes.Soft(), **kwargs)
 
 
 def main():
