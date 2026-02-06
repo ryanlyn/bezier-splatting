@@ -82,13 +82,14 @@ def rasterize(
     W: int,
     bg_color: Float[Tensor, " 3"] | None = None,
     tile_size: int = 16,
+    chunk_size: int = 16,
 ) -> Float[Tensor, "3 H W"]:
     """Tile-based differentiable 2D Gaussian splatting.
 
     Algorithm:
         1. Compute covariance matrices and bounding boxes
-        2. Assign Gaussians to tiles
-        3. Per-tile front-to-back alpha compositing
+        2. Assign Gaussians to tiles (vectorized GPU-side)
+        3. Chunked batched alpha compositing across tiles
         4. Stitch tiles into final image
 
     Args:
@@ -96,6 +97,7 @@ def rasterize(
         H, W: Image height and width in pixels
         bg_color: Background color (3,). Defaults to white.
         tile_size: Tile size in pixels. Default 16.
+        chunk_size: Number of tiles to process in parallel per chunk. Default 32.
 
     Returns:
         Rendered image (3, H, W) in [0, 1].
@@ -126,106 +128,148 @@ def rasterize(
     bb_max_x = means[:, 0] + radius_x
     bb_max_y = means[:, 1] + radius_y
 
-    # ── 2. Tile assignment ────────────────────────────────────────────
+    # ── 2. Vectorized tile assignment ─────────────────────────────────
     n_tiles_x = (W + tile_size - 1) // tile_size
     n_tiles_y = (H + tile_size - 1) // tile_size
+    n_tiles = n_tiles_x * n_tiles_y
 
-    # For each Gaussian, compute which tile range it covers
     tile_min_x = torch.clamp((bb_min_x / tile_size).floor().int(), 0, n_tiles_x - 1)
     tile_min_y = torch.clamp((bb_min_y / tile_size).floor().int(), 0, n_tiles_y - 1)
     tile_max_x = torch.clamp((bb_max_x / tile_size).ceil().int(), 0, n_tiles_x - 1)
     tile_max_y = torch.clamp((bb_max_y / tile_size).ceil().int(), 0, n_tiles_y - 1)
 
-    # Build tile→Gaussian mapping
-    # For moderate G (< ~10K), building a list per tile is fine
-    tile_gaussian_lists: list[list[int]] = [[] for _ in range(n_tiles_x * n_tiles_y)]
+    tile_ys = torch.arange(n_tiles_y, device=device)
+    tile_xs = torch.arange(n_tiles_x, device=device)
+    in_y = (tile_min_y[:, None] <= tile_ys) & (tile_ys <= tile_max_y[:, None])  # (G, TY)
+    in_x = (tile_min_x[:, None] <= tile_xs) & (tile_xs <= tile_max_x[:, None])  # (G, TX)
+    membership = (in_y[:, :, None] & in_x[:, None, :])  # (G, TY, TX)
+    membership = membership.reshape(G, n_tiles)  # (G, T)
 
-    tile_min_x_cpu = tile_min_x.cpu().tolist()
-    tile_min_y_cpu = tile_min_y.cpu().tolist()
-    tile_max_x_cpu = tile_max_x.cpu().tolist()
-    tile_max_y_cpu = tile_max_y.cpu().tolist()
+    gaussians_per_tile = membership.sum(dim=0)  # (T,)
 
-    for g_idx in range(G):
-        for ty in range(tile_min_y_cpu[g_idx], tile_max_y_cpu[g_idx] + 1):
-            for tx in range(tile_min_x_cpu[g_idx], tile_max_x_cpu[g_idx] + 1):
-                tile_gaussian_lists[ty * n_tiles_x + tx].append(g_idx)
-
-    # ── 3. Per-tile rendering ─────────────────────────────────────────
-    # Precompute sigmoid opacities
+    # ── 3. Pre-build pixel grid ───────────────────────────────────────
     opacities = torch.sigmoid(gaussians.opacities)  # (G,)
     colors = gaussians.colors  # (G, 3)
 
-    # Output image
+    px_x = torch.arange(W, device=device, dtype=dtype) + 0.5
+    px_y = torch.arange(H, device=device, dtype=dtype) + 0.5
+    grid_y, grid_x = torch.meshgrid(px_y, px_x, indexing="ij")
+    pixel_grid = torch.stack([grid_x, grid_y], dim=-1)  # (H, W, 2)
+
+    # ── 4. Chunked batched rendering ──────────────────────────────────
     image = torch.zeros(3, H, W, device=device, dtype=dtype)
 
-    for ty in range(n_tiles_y):
-        for tx in range(n_tiles_x):
-            tile_idx = ty * n_tiles_x + tx
-            g_indices = tile_gaussian_lists[tile_idx]
+    tile_order = torch.argsort(gaussians_per_tile)  # ascending by Gaussian count
+    tile_start = 0
 
-            # Tile pixel range
-            px_start_x = tx * tile_size
-            px_start_y = ty * tile_size
-            px_end_x = min(px_start_x + tile_size, W)
-            px_end_y = min(px_start_y + tile_size, H)
-            tw = px_end_x - px_start_x
-            th = px_end_y - px_start_y
+    while tile_start < n_tiles:
+        tile_end = min(tile_start + chunk_size, n_tiles)
+        chunk_tile_ids = tile_order[tile_start:tile_end]  # flat tile indices in this chunk
+        n_chunk = chunk_tile_ids.shape[0]
 
-            if len(g_indices) == 0:
-                # No Gaussians → background color
-                image[:, px_start_y:px_end_y, px_start_x:px_end_x] = bg_color[:, None, None]
-                continue
+        chunk_counts = gaussians_per_tile[chunk_tile_ids]  # (n_chunk,)
+        max_T = int(chunk_counts.max().item())
 
-            # Gather Gaussian data for this tile
-            idx = torch.tensor(g_indices, device=device, dtype=torch.long)
-            tile_means = means[idx]        # (T, 2)
-            tile_inv_cov = inv_cov[idx]    # (T, 2, 2)
-            tile_opacities = opacities[idx]  # (T,)
-            tile_colors = colors[idx]      # (T, 3)
-            T_count = len(g_indices)
+        if max_T == 0:
+            for ci in range(n_chunk):
+                flat_tid = chunk_tile_ids[ci].item()
+                ty = flat_tid // n_tiles_x
+                tx = flat_tid % n_tiles_x
+                px_sy = ty * tile_size
+                px_sx = tx * tile_size
+                px_ey = min(px_sy + tile_size, H)
+                px_ex = min(px_sx + tile_size, W)
+                image[:, px_sy:px_ey, px_sx:px_ex] = bg_color[:, None, None]
+            tile_start = tile_end
+            continue
 
-            # Build pixel grid for this tile
-            px_x = torch.arange(px_start_x, px_end_x, device=device, dtype=dtype) + 0.5
-            px_y = torch.arange(px_start_y, px_end_y, device=device, dtype=dtype) + 0.5
-            grid_y, grid_x = torch.meshgrid(px_y, px_x, indexing="ij")
-            pixels = torch.stack([grid_x, grid_y], dim=-1)  # (th, tw, 2)
+        # Build padded index tensors for the chunk: (n_chunk, max_T)
+        # Membership columns for the chunk tiles: (G, n_chunk)
+        chunk_membership = membership[:, chunk_tile_ids]  # (G, n_chunk)
 
-            # Displacement from each pixel to each Gaussian mean
-            # pixels: (th, tw, 2), tile_means: (T, 2) → d: (T, th, tw, 2)
-            d = pixels[None, :, :, :] - tile_means[:, None, None, :]
+        # For each tile in the chunk, collect sorted Gaussian indices
+        # Use argsort-based approach: for each tile column, nonzero gives indices
+        padded_idx = torch.zeros(n_chunk, max_T, device=device, dtype=torch.long)
+        valid_mask = torch.zeros(n_chunk, max_T, device=device, dtype=torch.bool)
 
-            # Mahalanobis distance: 0.5 * d^T Σ⁻¹ d
-            # d: (T, th, tw, 2), inv_cov: (T, 2, 2) → (T, th, tw)
-            d_transformed = torch.einsum("tpqi,tij->tpqj", d, tile_inv_cov)
-            mahal = 0.5 * (d * d_transformed).sum(dim=-1)  # (T, th, tw)
+        for ci in range(n_chunk):
+            g_ids = chunk_membership[:, ci].nonzero(as_tuple=False).squeeze(-1)
+            n_g = g_ids.shape[0]
+            if n_g > 0:
+                padded_idx[ci, :n_g] = g_ids
+                valid_mask[ci, :n_g] = True
 
-            # Alpha values: α = opacity * exp(-mahal), clamped to [0, 0.99]
-            alpha = tile_opacities[:, None, None] * torch.exp(-mahal)
-            alpha = torch.clamp(alpha, 0.0, 0.99)
+        # Gather Gaussian data: (n_chunk, max_T, ...)
+        flat_idx = padded_idx.reshape(-1)  # (n_chunk * max_T,)
+        g_means = means[flat_idx].reshape(n_chunk, max_T, 2)
+        g_inv_cov = inv_cov[flat_idx].reshape(n_chunk, max_T, 2, 2)
+        g_opacities = opacities[flat_idx].reshape(n_chunk, max_T)
+        g_colors = colors[flat_idx].reshape(n_chunk, max_T, 3)
 
-            # Front-to-back alpha compositing
-            # C = Σ c_i * α_i * Π_{j<i}(1 - α_j)
-            # Transmittance: T_i = Π_{j<i}(1 - α_j)
-            # Using cumulative product of (1 - α)
-            one_minus_alpha = 1.0 - alpha  # (T, th, tw)
+        # Zero out padding opacities so they don't contribute
+        g_opacities = g_opacities * valid_mask.float()
 
-            # Cumulative product shifted by one (T_0 = 1, T_1 = 1-α_0, ...)
-            # Use cumprod along the Gaussian dimension (dim=0)
-            transmittance = torch.ones_like(alpha)
-            if T_count > 1:
-                transmittance[1:] = torch.cumprod(one_minus_alpha[:-1], dim=0)
+        # Collect pixel grids for each tile in the chunk: (n_chunk, tile_size, tile_size, 2)
+        # Edge tiles may be smaller; pad to tile_size × tile_size
+        chunk_pixels = torch.zeros(n_chunk, tile_size, tile_size, 2, device=device, dtype=dtype)
+        tile_heights = []
+        tile_widths = []
 
-            # Weight for each Gaussian: w_i = α_i * T_i
-            weights = alpha * transmittance  # (T, th, tw)
+        for ci in range(n_chunk):
+            flat_tid = chunk_tile_ids[ci].item()
+            ty = flat_tid // n_tiles_x
+            tx = flat_tid % n_tiles_x
+            px_sy = ty * tile_size
+            px_sx = tx * tile_size
+            px_ey = min(px_sy + tile_size, H)
+            px_ex = min(px_sx + tile_size, W)
+            th = px_ey - px_sy
+            tw = px_ex - px_sx
+            tile_heights.append(th)
+            tile_widths.append(tw)
+            chunk_pixels[ci, :th, :tw, :] = pixel_grid[px_sy:px_ey, px_sx:px_ex, :]
 
-            # Weighted color sum
-            # tile_colors: (T, 3), weights: (T, th, tw)
-            rendered = torch.einsum("tc,tpq->cpq", tile_colors, weights)  # (3, th, tw)
+        # Displacement: (n_chunk, max_T, tile_size, tile_size, 2)
+        d = chunk_pixels[:, None, :, :, :] - g_means[:, :, None, None, :]
 
-            # Add background: remaining transmittance * bg_color
-            remaining_T = torch.prod(one_minus_alpha, dim=0)  # (th, tw)
-            rendered = rendered + bg_color[:, None, None] * remaining_T[None, :, :]
+        # Mahalanobis: einsum over the 2D displacement with inverse covariance
+        # d: (C, T, th, tw, 2), g_inv_cov: (C, T, 2, 2) → d_transformed: (C, T, th, tw, 2)
+        d_transformed = torch.einsum("ctpqi,ctij->ctpqj", d, g_inv_cov)
+        mahal = 0.5 * (d * d_transformed).sum(dim=-1)  # (n_chunk, max_T, tile_size, tile_size)
 
-            image[:, px_start_y:px_end_y, px_start_x:px_end_x] = rendered
+        # Alpha: (n_chunk, max_T, tile_size, tile_size)
+        alpha = g_opacities[:, :, None, None] * torch.exp(-mahal)
+        alpha = torch.clamp(alpha, 0.0, 0.99)
+
+        # Front-to-back compositing along the Gaussian dimension (dim=1)
+        one_minus_alpha = 1.0 - alpha  # (n_chunk, max_T, tile_size, tile_size)
+
+        transmittance = torch.ones_like(alpha)
+        if max_T > 1:
+            transmittance[:, 1:] = torch.cumprod(one_minus_alpha[:, :-1], dim=1)
+
+        weights = alpha * transmittance  # (n_chunk, max_T, tile_size, tile_size)
+
+        # Weighted color: g_colors (n_chunk, max_T, 3), weights (n_chunk, max_T, tile_size, tile_size)
+        rendered = torch.einsum("ntk,ntpq->nkpq", g_colors, weights)
+
+        # Remaining transmittance via reuse of cumprod result
+        remaining_T = transmittance[:, -1:] * one_minus_alpha[:, -1:]  # (n_chunk, 1, tile_size, tile_size)
+        remaining_T = remaining_T.squeeze(1)  # (n_chunk, tile_size, tile_size)
+
+        rendered = rendered + bg_color[None, :, None, None] * remaining_T[:, None, :, :]
+
+        # Write results back to the output image
+        for ci in range(n_chunk):
+            flat_tid = chunk_tile_ids[ci].item()
+            ty = flat_tid // n_tiles_x
+            tx = flat_tid % n_tiles_x
+            px_sy = ty * tile_size
+            px_sx = tx * tile_size
+            th = tile_heights[ci]
+            tw = tile_widths[ci]
+            image[:, px_sy:px_sy + th, px_sx:px_sx + tw] = rendered[ci, :, :th, :tw]
+
+        tile_start = tile_end
 
     return image
