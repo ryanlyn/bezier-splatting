@@ -151,7 +151,7 @@ def fit_image(
         n_open=n_open, n_closed=n_closed, H=H, W=W,
     ).to(device)
 
-    param_groups = _build_param_groups(scene)
+    param_groups = _build_param_groups(scene, H, W)
     optimizer = torch.optim.Adam(param_groups)
 
     loss_history: list[float] = []
@@ -194,7 +194,7 @@ def fit_image(
             with torch.no_grad():
                 _prune_and_densify(scene, target, rendered, step, steps, H, W)
             # Rebuild optimizer (fresh Adam state for new params)
-            param_groups = _build_param_groups(scene)
+            param_groups = _build_param_groups(scene, H, W)
             optimizer = torch.optim.Adam(param_groups)
             # Apply accumulated lr decay to new optimizer
             for group in optimizer.param_groups:
@@ -203,17 +203,19 @@ def fit_image(
     return scene
 
 
-def _build_param_groups(scene: VectorGraphicsScene) -> list[dict]:
+def _build_param_groups(scene: VectorGraphicsScene, H: int, W: int) -> list[dict]:
     """Build optimizer parameter groups with per-type learning rates.
 
-    Control points are in [0, 1] normalized coordinates.
-    lr=1e-3 for CPs gives effective pixel displacement of ~0.25 px/iter at 256×256.
+    Control points are in [0, 1] normalized coordinates. The CP learning rate
+    is scaled by resolution so the effective pixel displacement is ~0.25 px/iter
+    regardless of image size.
     """
+    cp_lr = 0.25 / max(H, W)
     groups: list[dict] = []
 
     if scene.n_open > 0:
         groups.extend([
-            {"params": [scene.open_control_points], "lr": 1e-3, "name": "open_cp"},
+            {"params": [scene.open_control_points], "lr": cp_lr, "name": "open_cp"},
             {"params": [scene.open_colors], "lr": 0.01, "name": "open_colors"},
             {"params": [scene.open_opacities], "lr": 0.1, "name": "open_opacities"},
             {"params": [scene.open_stroke_widths], "lr": 0.05, "name": "open_stroke_widths"},
@@ -221,7 +223,7 @@ def _build_param_groups(scene: VectorGraphicsScene) -> list[dict]:
 
     if scene.n_closed > 0:
         groups.extend([
-            {"params": [scene.closed_boundary_cp], "lr": 1e-3, "name": "closed_cp"},
+            {"params": [scene.closed_boundary_cp], "lr": cp_lr, "name": "closed_cp"},
             {"params": [scene.closed_colors], "lr": 0.01, "name": "closed_colors"},
             {"params": [scene.closed_opacities], "lr": 0.1, "name": "closed_opacities"},
         ])
