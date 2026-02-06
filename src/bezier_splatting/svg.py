@@ -129,6 +129,8 @@ def scene_to_svg(scene: VectorGraphicsScene, H: int | None = None, W: int | None
     # Closed curves (usually larger → background)
     if scene.n_closed > 0:
         closed_opacities = torch.sigmoid(scene.closed_opacities).detach().cpu()
+        if closed_opacities.ndim == 2:
+            closed_opacities = closed_opacities.mean(dim=-1)
         for i in range(scene.n_closed):
             opacity = closed_opacities[i].item()
             if opacity < 0.01:

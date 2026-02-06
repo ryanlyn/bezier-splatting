@@ -12,14 +12,18 @@ from torch import Tensor
 
 def model_to_pixel(cp: Float[Tensor, "*batch 2"], H: int, W: int) -> Float[Tensor, "*batch 2"]:
     """Convert [-1, 1] model coords to pixel coords."""
-    scale = torch.tensor([W, H], device=cp.device, dtype=cp.dtype)
-    return (cp + 1) / 2 * scale
+    out = torch.empty_like(cp)
+    out[..., 0] = (cp[..., 0] + 1.0) * (0.5 * W)
+    out[..., 1] = (cp[..., 1] + 1.0) * (0.5 * H)
+    return out
 
 
 def pixel_to_model(cp: Float[Tensor, "*batch 2"], H: int, W: int) -> Float[Tensor, "*batch 2"]:
     """Convert pixel coords to [-1, 1] model coords."""
-    scale = torch.tensor([W, H], device=cp.device, dtype=cp.dtype)
-    return cp / scale * 2 - 1
+    out = torch.empty_like(cp)
+    out[..., 0] = cp[..., 0] * (2.0 / W) - 1.0
+    out[..., 1] = cp[..., 1] * (2.0 / H) - 1.0
+    return out
 
 
 def legacy_to_model(cp: Float[Tensor, "*batch 2"]) -> Float[Tensor, "*batch 2"]:

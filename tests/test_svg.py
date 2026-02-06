@@ -316,14 +316,14 @@ class TestSceneToSvg:
         expected = torch.sigmoid(torch.tensor([1.0, 2.0, 3.0])).mean().item()
         assert f'opacity="{expected:.3f}"' in svg
 
-    def test_opacity_closed_is_sigmoid(self):
-        """Closed curve SVG opacity = sigmoid(single opacity)."""
+    def test_opacity_closed_is_mean_profile(self):
+        """Closed curve SVG opacity = mean(sigmoid(profile opacities))."""
         scene = VectorGraphicsScene(n_open=0, n_closed=1, H=64, W=64)
         with torch.no_grad():
-            scene.closed_opacities[0] = 1.5
+            scene.closed_opacities[0] = torch.tensor([0.0, 1.0, 2.0])
         svg = scene_to_svg(scene)
 
-        expected = torch.sigmoid(torch.tensor(1.5)).item()
+        expected = torch.sigmoid(torch.tensor([0.0, 1.0, 2.0])).mean().item()
         assert f'opacity="{expected:.3f}"' in svg
 
     def test_svg_dimensions(self):

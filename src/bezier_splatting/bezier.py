@@ -5,6 +5,17 @@ from jaxtyping import Float
 from torch import Tensor
 
 _BINOM_COEFFS: dict[int, list[int]] = {1: [1, 1], 2: [1, 2, 1], 3: [1, 3, 3, 1]}
+_BINOM_TENSOR_CACHE: dict[tuple[int, str, int | None, torch.dtype], Tensor] = {}
+
+
+def _cached_binom_tensor(degree: int, ref: Tensor) -> Tensor:
+    """Return cached binomial coefficients tensor on ref's device/dtype."""
+    key = (degree, ref.device.type, ref.device.index, ref.dtype)
+    cached = _BINOM_TENSOR_CACHE.get(key)
+    if cached is None:
+        cached = torch.tensor(_BINOM_COEFFS[degree], device=ref.device, dtype=ref.dtype)
+        _BINOM_TENSOR_CACHE[key] = cached
+    return cached
 
 
 def bernstein_basis(t: Float[Tensor, " *batch"], degree: int) -> Float[Tensor, "*batch M1"]:
@@ -20,7 +31,7 @@ def bernstein_basis(t: Float[Tensor, " *batch"], degree: int) -> Float[Tensor, "
         Bernstein basis values. Shape: (*batch, degree + 1)
     """
     if degree in _BINOM_COEFFS:
-        binom = torch.tensor(_BINOM_COEFFS[degree], device=t.device, dtype=t.dtype)
+        binom = _cached_binom_tensor(degree, t)
     else:
         j = torch.arange(degree + 1, device=t.device, dtype=t.dtype)
         log_binom = (

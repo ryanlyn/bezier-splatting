@@ -14,7 +14,7 @@ def collect_gradient_stats(scene: VectorGraphicsScene) -> dict:
             open_cp_grad: Tensor | None — (N, 10, 2) gradient magnitudes
             closed_cp_grad: Tensor | None — (N, 2, num_cp, 2) gradient magnitudes
             open_opacity_grad: Tensor | None — (N, 3) gradient magnitudes
-            closed_opacity_grad: Tensor | None — (N,) gradient magnitudes
+            closed_opacity_grad: Tensor | None — (N,) or (N, 3) gradient magnitudes
             summary: dict with mean_grad_norm, max_grad_norm, has_nan
     """
     result: dict = {
@@ -84,7 +84,7 @@ def collect_curve_stats(scene: VectorGraphicsScene, H: int, W: int) -> dict:
         Dict with keys:
             open_opacities: Tensor (N, 3) in sigmoid space
             open_widths: Tensor (N,) in pixel space
-            closed_opacities: Tensor (N,) in sigmoid space
+            closed_opacities: Tensor (N, 3) in sigmoid space
             mean_scales: dict with 'open' and 'closed' Tensors (per-curve mean sigma)
             n_open: int
             n_closed: int
@@ -98,7 +98,7 @@ def collect_curve_stats(scene: VectorGraphicsScene, H: int, W: int) -> dict:
     result: dict = {
         "open_opacities": torch.empty(0, 3, device=device),
         "open_widths": torch.empty(0, device=device),
-        "closed_opacities": torch.empty(0, device=device),
+        "closed_opacities": torch.empty(0, 3, device=device),
         "mean_scales": {"open": torch.empty(0, device=device), "closed": torch.empty(0, device=device)},
         "n_open": scene.n_open,
         "n_closed": scene.n_closed,

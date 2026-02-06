@@ -142,6 +142,8 @@ def _render_curve_overlay(scene: VectorGraphicsScene, H: int, W: int) -> np.ndar
     # -- Closed curves: filled regions (top boundary forward, bottom backward) --
     if scene.n_closed > 0:
         closed_opacities = torch.sigmoid(scene.closed_opacities).detach().cpu()
+        if closed_opacities.ndim == 2:
+            closed_opacities = closed_opacities.mean(dim=-1)
 
         # Compute first-intermediate-curve weight for boundary σ_y estimation
         rho = scene.closed_sampler.rho

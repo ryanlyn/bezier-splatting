@@ -5,9 +5,9 @@ pixel coordinates at sampling time via (H, W) arguments.
 """
 
 from dataclasses import dataclass
+import math
 
 import torch
-import torch.nn.functional as F
 from jaxtyping import Float, Int
 from torch import Tensor
 
@@ -54,6 +54,85 @@ def _central_diff_angles(points: Float[Tensor, "*batch K 2"]) -> Float[Tensor, "
     bwd = points[..., -1:, :] - points[..., -2:-1, :]    # (..., 1, 2)
     diffs = torch.cat([fwd, central, bwd], dim=-2)       # (..., K, 2)
     return torch.atan2(diffs[..., 1], diffs[..., 0])
+
+
+def _closed_interior_weights(
+    num_intermediate: int,
+    mode: str,
+    boundary_bias: float,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Float[Tensor, " R"]:
+    """Interpolation weights for interior closed-curve rows.
+
+    Returns weights in (0, 1) for ``R=num_intermediate`` interior rows.
+    Boundaries are handled separately as rows 0 (top, w=0) and 1 (bottom, w=1).
+    """
+    if num_intermediate == 0:
+        return torch.empty(0, dtype=dtype, device=device)
+
+    if mode == "boundary_biased":
+        # Legacy mode: cosine + power-law bias.
+        r_total = num_intermediate + 2
+        uniform = torch.linspace(0, 1, r_total, device=device, dtype=dtype)
+        biased = 0.5 - 0.5 * torch.cos(torch.pi * uniform.pow(1.0 / boundary_bias))
+        return biased[1:-1]
+
+    if mode == "official_cdf":
+        # Official-style mode: Normal CDF over [-2, 2], no explicit endpoint rows.
+        grid = torch.linspace(-2, 2, num_intermediate, device=device, dtype=dtype)
+        return 0.5 * (1.0 + torch.erf(grid / math.sqrt(2.0) / 0.85))
+
+    raise ValueError(
+        f"Unknown sampling mode {mode!r}. Expected 'boundary_biased' or 'official_cdf'.",
+    )
+
+
+def _expand_closed_opacities(
+    opacities: Tensor,
+    rows_total: int,
+    samples_per_curve: int,
+) -> Tensor:
+    """Expand per-curve closed opacity params to per-Gaussian opacities.
+
+    Supports:
+        - legacy scalar: (N,) or (N, 1)
+        - profile: (N, 3) = [boundary_top, interior_mid, boundary_bottom]
+    """
+    if opacities.ndim == 1:
+        profile = opacities[:, None].expand(-1, 3)
+    elif opacities.ndim == 2 and opacities.shape[1] == 1:
+        profile = opacities.expand(-1, 3)
+    elif opacities.ndim == 2 and opacities.shape[1] >= 3:
+        profile = opacities[:, :3]
+    else:
+        raise ValueError(
+            f"closed opacities must have shape (N,), (N,1), or (N,3+). Got {tuple(opacities.shape)}.",
+        )
+
+    top = profile[:, 0:1]
+    middle = profile[:, 1:2]
+    bottom = profile[:, 2:3]
+
+    num_intermediate = rows_total - 2
+    if num_intermediate > 0:
+        split = num_intermediate // 2
+        first_len = split
+        second_len = num_intermediate - split
+
+        parts: list[Tensor] = []
+        if first_len > 0:
+            w1 = torch.linspace(0, 1, first_len, device=profile.device, dtype=profile.dtype).unsqueeze(0)
+            parts.append((1 - w1) * top + w1 * middle)
+        if second_len > 0:
+            w2 = torch.linspace(0, 1, second_len, device=profile.device, dtype=profile.dtype).unsqueeze(0)
+            parts.append((1 - w2) * middle + w2 * bottom)
+        area = torch.cat(parts, dim=1) if parts else torch.empty(profile.shape[0], 0, device=profile.device, dtype=profile.dtype)
+    else:
+        area = torch.empty(profile.shape[0], 0, device=profile.device, dtype=profile.dtype)
+
+    row_opacity = torch.cat([top, bottom, area], dim=1)  # (N, rows_total)
+    return row_opacity.unsqueeze(-1).expand(-1, -1, samples_per_curve).reshape(-1)
 
 
 class OpenCurveSampler:
@@ -160,17 +239,19 @@ class ClosedCurveSampler:
         samples_per_curve: int = 15,
         rho: float = 2.0,
         boundary_bias: float = 2.0,
+        sampling_mode: str = "boundary_biased",
     ):
         self.num_intermediate = num_intermediate
         self.samples_per_curve = samples_per_curve
         self.rho = rho
         self.boundary_bias = boundary_bias
+        self.sampling_mode = sampling_mode
 
     def __call__(
         self,
         boundary_cp: Float[Tensor, "N 2 CP 2"],
         colors: Float[Tensor, "N 3"],
-        opacities: Float[Tensor, " N"],
+        opacities: Float[Tensor, "N 3"] | Float[Tensor, " N"],
         H: int = 256,
         W: int = 256,
         curve_id_offset: int = 0,
@@ -197,18 +278,25 @@ class ClosedCurveSampler:
         top_cp = bcp_px[:, 0]   # (N, num_cp, 2)
         bot_cp = bcp_px[:, 1]   # (N, num_cp, 2)
 
-        # Interpolation weights for R+2 curves (including boundaries at 0 and 1)
-        # Use boundary-biased spacing: power-law pushes samples toward boundaries
-        uniform = torch.linspace(0, 1, R_total, device=device, dtype=boundary_cp.dtype)
-        # Apply boundary bias via power-law: more samples near 0 and 1
-        # beta distribution approximation: 0.5 - 0.5*cos(pi*u^(1/bias))
-        biased = 0.5 - 0.5 * torch.cos(torch.pi * uniform.pow(1.0 / self.boundary_bias))
-        interp_weights = biased  # (R_total,)
+        # Build row-ordered control points:
+        #   row 0 -> top boundary
+        #   row 1 -> bottom boundary
+        #   rows 2.. -> interior interpolated curves
+        interior_w = _closed_interior_weights(
+            R,
+            self.sampling_mode,
+            self.boundary_bias,
+            boundary_cp.dtype,
+            device,
+        )  # (R,)
 
-        # Interpolate control points: P^(k) = (1 - w_k)*top + w_k*bot
-        w = interp_weights[None, :, None, None]  # (1, R_total, 1, 1)
-        interp_cp = (1 - w) * top_cp[:, None] + w * bot_cp[:, None]
-        # (N, R_total, num_cp, 2)
+        if R > 0:
+            w = interior_w[None, :, None, None]  # (1, R, 1, 1)
+            interior_cp = (1 - w) * top_cp[:, None] + w * bot_cp[:, None]  # (N, R, CP, 2)
+            row_cp = torch.cat([top_cp[:, None], bot_cp[:, None], interior_cp], dim=1)
+        else:
+            row_cp = torch.cat([top_cp[:, None], bot_cp[:, None]], dim=1)
+        # row_cp: (N, R_total, CP, 2)
 
         num_cp = boundary_cp.shape[2]
 
@@ -216,7 +304,7 @@ class ClosedCurveSampler:
         # tangent direction can be degenerate and scales might be zero
         t = torch.linspace(0.007, 0.993, K, device=device, dtype=boundary_cp.dtype)
 
-        flat_cp = interp_cp.reshape(N * R_total, num_cp, 2)
+        flat_cp = row_cp.reshape(N * R_total, num_cp, 2)
         points = evaluate_bezier(flat_cp, t)    # (N*R_total, K, 2)
 
         points = points.reshape(N, R_total, K, 2)
@@ -230,24 +318,35 @@ class ClosedCurveSampler:
         spacings_along = torch.cat([spacings_along, spacings_along[..., -1:]], dim=2)
         sigma_x = spacings_along / self.rho  # (N, R_total, K)
 
-        # σ_y: cross-curve spacing (distance to next curve at same k)
-        # Paper Eq. 7: σ_y(r,k) = |X_{r+1,k} - X_{r,k}| / rho
-        # At shared endpoints, boundaries pinch together → spacing goes to 0.
-        diffs_cross = torch.diff(points, dim=1)  # (N, R_total-1, K, 2)
+        # σ_y: cross-curve spacing (distance between adjacent rows at same k).
+        # Use order [top, interiors..., bottom] for spacing computation, then
+        # map back to output row order [top, bottom, interiors...].
+        if R_total > 2:
+            perm = torch.empty(R_total, device=device, dtype=torch.long)
+            perm[0] = 0
+            if R_total > 3:
+                perm[1:-1] = torch.arange(2, R_total, device=device, dtype=torch.long)
+            perm[-1] = 1
+        else:
+            perm = torch.arange(R_total, device=device, dtype=torch.long)
+        inv_perm = torch.argsort(perm)
+
+        points_reordered = points[:, perm]  # (N, R_total, K, 2)
+        diffs_cross = torch.diff(points_reordered, dim=1)  # (N, R_total-1, K, 2)
         spacings_cross = torch.sqrt((diffs_cross ** 2).sum(dim=-1) + 1e-12)  # (N, R_total-1, K)
-        # Pad: last curve uses spacing to previous (not first!)
-        spacings_cross = torch.cat([spacings_cross, spacings_cross[:, -1:]], dim=1)  # (N, R_total, K)
-        sigma_y = spacings_cross / self.rho  # (N, R_total, K)
+        sigma_y_reordered = torch.cat([spacings_cross[:, :1], spacings_cross], dim=1) / self.rho
+        sigma_y = sigma_y_reordered[:, inv_perm]  # (N, R_total, K)
 
         # --- Mode-specific scale clamping (all non-inplace for autograd) ---
 
         # Boundary taper: attenuate σ_x at first/last 3 samples to soften endpoints
         if K >= 3:
-            taper = torch.tensor([0.4, 0.9, 1.0], device=device, dtype=sigma_x.dtype)
             # Build taper mask for full K dimension: [0.4, 0.9, 1.0, ..., 1.0, ..., 1.0, 0.9, 0.4]
             taper_full = torch.ones(K, device=device, dtype=sigma_x.dtype)
-            taper_full[:3] = taper
-            taper_full[-3:] = taper.flip(0)
+            taper_full[0] = 0.4
+            taper_full[1] = 0.9
+            taper_full[-2] = 0.9
+            taper_full[-1] = 0.4
             sigma_x = sigma_x * taper_full
 
         # Split into boundary (indices 0,1) and interior (indices 2+)
@@ -282,7 +381,7 @@ class ClosedCurveSampler:
         rotations_flat = angles.reshape(G)
 
         colors_expanded = colors[:, None, None, :].expand(-1, R_total, K, -1).reshape(G, 3)
-        opacities_expanded = opacities[:, None, None].expand(-1, R_total, K).reshape(G)
+        opacities_expanded = _expand_closed_opacities(opacities, R_total, K)
 
         # Curve IDs: all Gaussians from closed curve i share the same ID
         ids = torch.arange(N, device=device, dtype=torch.long)[:, None, None].expand(-1, R_total, K).reshape(G)

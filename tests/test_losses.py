@@ -140,6 +140,12 @@ class TestOpacityPrior:
         loss.backward()
         assert opacities.grad is not None
 
+    def test_profile_shape(self):
+        """Opacity prior supports closed profile logits shaped (N, 3)."""
+        opacities = torch.zeros(4, 3)
+        loss = opacity_prior(opacities)
+        assert abs(loss.item() - 0.5) < 0.01
+
 
 class TestCurvatureLoss:
     """Tests for curvature_loss."""
