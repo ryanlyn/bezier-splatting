@@ -8,6 +8,7 @@ All control points are stored in [0, 1] normalized coordinates.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable
 
 import torch
@@ -125,6 +126,7 @@ def fit_image(
     lr_step_size: int = 5000,
     lr_gamma: float = 0.5,
     callback: Callable[[int, float, VectorGraphicsScene], None] | None = None,
+    debug: bool | str = False,
 ) -> VectorGraphicsScene:
     """Optimize a VectorGraphicsScene to reconstruct a target image.
 
@@ -140,12 +142,45 @@ def fit_image(
         lr_step_size: StepLR decay period.
         lr_gamma: StepLR multiplicative decay factor.
         callback: Optional callback(step, loss, scene) for monitoring.
+            If the callback returns ``False``, training stops early.
+        debug: When truthy, activate debug logging. When a string, use it as
+            the output directory (default ``"debug_output"``).
 
     Returns:
         Optimized VectorGraphicsScene.
     """
     _, H, W = target.shape
     device = target.device
+
+    if debug:
+        from .debug import (
+            DebugTracker,
+            check_health,
+            collect_curve_stats,
+            collect_gradient_stats,
+            save_checkpoint,
+            snapshot_scene,
+        )
+        from .metrics import compute_psnr
+
+        output_dir = debug if isinstance(debug, str) else "debug_output"
+        tracker = DebugTracker(
+            run_name=f"fit_{H}x{W}",
+            output_dir=output_dir,
+            config={
+                "n_open": n_open,
+                "n_closed": n_closed,
+                "steps": steps,
+                "prune_every": prune_every,
+                "prune_stop_before_end": prune_stop_before_end,
+                "lambda_xing": lambda_xing,
+                "lr_step_size": lr_step_size,
+                "lr_gamma": lr_gamma,
+                "H": H,
+                "W": W,
+            },
+        )
+        health_history: dict = {}
 
     scene = VectorGraphicsScene(
         n_open=n_open, n_closed=n_closed, H=H, W=W,
@@ -173,16 +208,46 @@ def fit_image(
 
         loss = mse_loss + lambda_xing * xing_loss
         loss.backward()
+
+        if debug:
+            grad_stats = collect_gradient_stats(scene)
+
         optimizer.step()
 
         loss_val = loss.item()
         loss_history.append(loss_val)
 
+        if debug:
+            psnr_val = compute_psnr(rendered.detach(), target).item()
+            tracker.log_scalars(step, {
+                "loss": loss_val,
+                "mse_loss": mse_loss.item(),
+                "xing_loss": xing_loss.item(),
+                "psnr": psnr_val,
+                "n_open": scene.n_open,
+                "n_closed": scene.n_closed,
+                "mean_grad_norm": grad_stats["summary"]["mean_grad_norm"],
+            })
+
+            warnings = check_health(scene, step, health_history)
+            if warnings:
+                for w in warnings:
+                    print(f"  [DEBUG WARNING] {w}")
+
+            if step % 100 == 0:
+                curve_stats = collect_curve_stats(scene, H, W)
+                tracker.log_snapshot(step, "curve_stats", curve_stats)
+                tracker.log_snapshot(step, "grad_stats", grad_stats)
+
+            if step % 500 == 0 or step == steps - 1:
+                save_checkpoint(scene, step, {"loss": loss_val, "psnr": psnr_val}, Path(output_dir))
+
         if step % log_every == 0:
             print(f"Step {step:5d}/{steps} | loss={loss_val:.6f} | MSE={mse_loss.item():.6f}")
 
         if callback is not None:
-            callback(step, loss_val, scene)
+            if callback(step, loss_val, scene) is False:
+                break
 
         # Pruning and densification
         should_prune = (
@@ -191,14 +256,29 @@ def fit_image(
             and step < steps - prune_stop_before_end
         )
         if should_prune:
+            if debug:
+                pre_prune = snapshot_scene(scene)
+
             with torch.no_grad():
                 _prune_and_densify(scene, target, rendered, step, steps, H, W)
+
+            if debug:
+                post_prune = snapshot_scene(scene)
+                tracker.log_snapshot(step, "prune_before", pre_prune)
+                tracker.log_snapshot(step, "prune_after", post_prune)
+                with torch.no_grad():
+                    rendered_at_prune = scene(H, W)
+                tracker.log_snapshot(step, "rendered_at_prune", {"image": rendered_at_prune.detach().cpu()})
+
             # Rebuild optimizer (fresh Adam state for new params)
             param_groups = _build_param_groups(scene, H, W)
             optimizer = torch.optim.Adam(param_groups)
             # Apply accumulated lr decay to new optimizer
             for group in optimizer.param_groups:
                 group["lr"] *= lr_decay
+
+    if debug:
+        tracker.finish()
 
     return scene
 
@@ -223,7 +303,8 @@ def _build_param_groups(scene: VectorGraphicsScene, H: int, W: int) -> list[dict
 
     if scene.n_closed > 0:
         groups.extend([
-            {"params": [scene.closed_boundary_cp], "lr": cp_lr, "name": "closed_cp"},
+            {"params": [scene.closed_shared_pts], "lr": cp_lr, "name": "closed_shared_pts"},
+            {"params": [scene.closed_interior_cp], "lr": cp_lr, "name": "closed_interior_cp"},
             {"params": [scene.closed_colors], "lr": 0.01, "name": "closed_colors"},
             {"params": [scene.closed_opacities], "lr": 0.1, "name": "closed_opacities"},
         ])
@@ -304,13 +385,15 @@ def _prune_and_densify(
 
         if pruned_closed > 0:
             if keep_mask.any():
-                scene.closed_boundary_cp = nn.Parameter(scene.closed_boundary_cp[keep_mask].clone())
+                scene.closed_shared_pts = nn.Parameter(scene.closed_shared_pts[keep_mask].clone())
+                scene.closed_interior_cp = nn.Parameter(scene.closed_interior_cp[keep_mask].clone())
                 scene.closed_colors = nn.Parameter(scene.closed_colors[keep_mask].clone())
                 scene.closed_opacities = nn.Parameter(scene.closed_opacities[keep_mask].clone())
                 scene.n_closed = keep_mask.sum().item()
             else:
-                num_cp = scene.closed_boundary_cp.shape[2]
-                scene.closed_boundary_cp = nn.Parameter(torch.empty(0, 2, num_cp, 2, device=device))
+                num_interior = scene.closed_interior_cp.shape[2]
+                scene.closed_shared_pts = nn.Parameter(torch.empty(0, 2, 2, device=device))
+                scene.closed_interior_cp = nn.Parameter(torch.empty(0, 2, num_interior, 2, device=device))
                 scene.closed_colors = nn.Parameter(torch.empty(0, 3, device=device))
                 scene.closed_opacities = nn.Parameter(torch.empty(0, device=device))
                 scene.n_closed = 0
@@ -386,7 +469,7 @@ def _densify_curves(
     )
     top_indices = sorted_indices[:n_new]
 
-    closed_cp_count = scene.closed_boundary_cp.shape[2]
+    closed_cp_count = scene.closed_interior_cp.shape[2] + 2
 
     new_open_cps: list[Tensor] = []
     new_open_colors: list[Tensor] = []
@@ -441,14 +524,20 @@ def _densify_curves(
         new_opacities = torch.zeros(m, device=device)
 
         if scene.n_closed > 0:
-            scene.closed_boundary_cp = nn.Parameter(torch.cat([scene.closed_boundary_cp, new_bcp_t]))
+            new_shared = torch.stack([new_bcp_t[:, 0, 0], new_bcp_t[:, 0, -1]], dim=1)  # (M, 2, 2)
+            new_interior = new_bcp_t[:, :, 1:-1, :]  # (M, 2, num_cp-2, 2)
+            scene.closed_shared_pts = nn.Parameter(torch.cat([scene.closed_shared_pts, new_shared]))
+            scene.closed_interior_cp = nn.Parameter(torch.cat([scene.closed_interior_cp, new_interior]))
             scene.closed_colors = nn.Parameter(torch.cat([scene.closed_colors, new_colors_t]))
             scene.closed_opacities = nn.Parameter(torch.cat([scene.closed_opacities, new_opacities]))
         else:
-            scene.closed_boundary_cp = nn.Parameter(new_bcp_t)
+            new_shared = torch.stack([new_bcp_t[:, 0, 0], new_bcp_t[:, 0, -1]], dim=1)
+            new_interior = new_bcp_t[:, :, 1:-1, :]
+            scene.closed_shared_pts = nn.Parameter(new_shared)
+            scene.closed_interior_cp = nn.Parameter(new_interior)
             scene.closed_colors = nn.Parameter(new_colors_t)
             scene.closed_opacities = nn.Parameter(new_opacities)
-        scene.n_closed = scene.closed_boundary_cp.shape[0]
+        scene.n_closed = scene.closed_shared_pts.shape[0]
 
 
 def _make_open_curve(

@@ -55,15 +55,16 @@ class VectorGraphicsScene(nn.Module):
             self.register_buffer("open_opacities", torch.empty(0, 3))
             self.register_buffer("open_stroke_widths", torch.empty(0))
 
-        # ── Closed curve parameters (shared endpoints enforced) ──
+        # ── Closed curve parameters (structurally shared endpoints) ──
         if n_closed > 0:
-            self.closed_boundary_cp = nn.Parameter(
-                self._init_closed_cps(n_closed, closed_cp)
-            )
+            shared_pts, interior_cp = self._init_closed_cps(n_closed, closed_cp)
+            self.closed_shared_pts = nn.Parameter(shared_pts)
+            self.closed_interior_cp = nn.Parameter(interior_cp)
             self.closed_colors = nn.Parameter(torch.rand(n_closed, 3))
             self.closed_opacities = nn.Parameter(torch.zeros(n_closed))
         else:
-            self.register_buffer("closed_boundary_cp", torch.empty(0, 2, closed_cp, 2))
+            self.register_buffer("closed_shared_pts", torch.empty(0, 2, 2))
+            self.register_buffer("closed_interior_cp", torch.empty(0, 2, closed_cp - 2, 2))
             self.register_buffer("closed_colors", torch.empty(0, 3))
             self.register_buffer("closed_opacities", torch.empty(0))
 
@@ -85,8 +86,13 @@ class VectorGraphicsScene(nn.Module):
         return cps.clamp(0, 1)
 
     @staticmethod
-    def _init_closed_cps(n: int, num_cp: int) -> Tensor:
-        """Initialize closed curve boundary CPs with shared endpoints."""
+    def _init_closed_cps(n: int, num_cp: int) -> tuple[Tensor, Tensor]:
+        """Initialize closed curve boundary CPs with shared endpoints.
+
+        Returns:
+            shared_pts: (N, 2, 2) — shared [start, end] × [x, y]
+            interior_cp: (N, 2, num_cp-2, 2) — interior CPs per boundary
+        """
         cps = torch.zeros(n, 2, num_cp, 2)
         centers = torch.rand(n, 2)
         size = 0.08
@@ -99,42 +105,44 @@ class VectorGraphicsScene(nn.Module):
             cps[:, boundary, :, 0] = x_vals
             cps[:, boundary, :, 1] = y_vals
 
-        # Enforce shared endpoints: first and last CPs of both boundaries must match
+        # Shared endpoints: average first and last CPs of both boundaries
         shared_start = (cps[:, 0, 0] + cps[:, 1, 0]) / 2
         shared_end = (cps[:, 0, -1] + cps[:, 1, -1]) / 2
-        cps[:, 0, 0] = shared_start
-        cps[:, 1, 0] = shared_start
-        cps[:, 0, -1] = shared_end
-        cps[:, 1, -1] = shared_end
+        shared_pts = torch.stack([shared_start, shared_end], dim=1).clamp(0, 1)  # (N, 2, 2)
 
-        return cps.clamp(0, 1)
+        interior_cp = cps[:, :, 1:-1, :].clamp(0, 1)  # (N, 2, num_cp-2, 2)
 
-    def _enforce_shared_endpoints(self) -> Tensor:
-        """Return closed boundary CPs with shared endpoints enforced.
+        return shared_pts, interior_cp
 
-        Averages the first and last CPs of each boundary pair so they remain
-        coincident during optimization.
+    def _assemble_boundary_cp(self) -> Tensor:
+        """Reconstruct full (N, 2, num_cp, 2) from shared endpoints + interior CPs.
+
+        Both boundaries share the exact same start/end points because they
+        are read from the single closed_shared_pts tensor.
         """
-        bcp = self.closed_boundary_cp  # (N, 2, num_cp, 2)
-        if bcp.shape[0] == 0:
-            return bcp
+        if self.n_closed == 0:
+            num_cp = self.closed_interior_cp.shape[2] + 2
+            return torch.empty(0, 2, num_cp, 2, device=self.closed_interior_cp.device)
+        # Broadcast shared points to both boundaries: (N, 2) -> (N, 2, 1, 2)
+        start = self.closed_shared_pts[:, 0, :].unsqueeze(1).unsqueeze(1).expand(-1, 2, 1, -1)
+        end = self.closed_shared_pts[:, 1, :].unsqueeze(1).unsqueeze(1).expand(-1, 2, 1, -1)
+        return torch.cat([start, self.closed_interior_cp, end], dim=2)
 
-        shared_start = (bcp[:, 0, 0] + bcp[:, 1, 0]) / 2  # (N, 2)
-        shared_end = (bcp[:, 0, -1] + bcp[:, 1, -1]) / 2
+    @property
+    def closed_boundary_cp(self) -> Tensor:
+        """Assembled (N, 2, num_cp, 2) boundary CPs with shared endpoints.
 
-        # Build new tensor with shared endpoints
-        bcp_fixed = bcp.clone()
-        bcp_fixed[:, 0, 0] = shared_start
-        bcp_fixed[:, 1, 0] = shared_start
-        bcp_fixed[:, 0, -1] = shared_end
-        bcp_fixed[:, 1, -1] = shared_end
-        return bcp_fixed
+        Read-only view for backward compatibility. For parameter access,
+        use closed_shared_pts and closed_interior_cp directly.
+        """
+        return self._assemble_boundary_cp()
 
-    def forward(self, H: int | None = None, W: int | None = None) -> Tensor:
-        """Render the scene."""
-        H = H or self.H
-        W = W or self.W
+    def get_gaussians(self, H: int, W: int) -> GaussianParams | None:
+        """Assemble and depth-sort all Gaussians without rasterizing.
 
+        Returns ``None`` when the scene has no curves (both n_open and
+        n_closed are zero or all samplers produce empty output).
+        """
         all_gaussians: list[GaussianParams] = []
         curve_areas: list[tuple[Tensor, int]] = []  # (area_per_curve, n_gaussians_per_curve)
         curve_id_offset = 0
@@ -151,7 +159,6 @@ class VectorGraphicsScene(nn.Module):
             )
             if open_g.means.shape[0] > 0:
                 all_gaussians.append(open_g)
-                # Per-curve area: compute from CPs scaled to pixels
                 cp_px = self.open_control_points * torch.tensor([W, H], device=self.open_control_points.device, dtype=self.open_control_points.dtype)
                 edge_len = torch.norm(cp_px[:, 1:] - cp_px[:, :-1], dim=-1).sum(dim=-1)  # (N,)
                 sw = 0.5 + torch.sigmoid(self.open_stroke_widths) * 4.5
@@ -162,7 +169,7 @@ class VectorGraphicsScene(nn.Module):
 
         # ── Sample from closed curves ──
         if self.n_closed > 0:
-            bcp = self._enforce_shared_endpoints()
+            bcp = self._assemble_boundary_cp()
             closed_g = self.closed_sampler(
                 bcp,
                 torch.sigmoid(self.closed_colors),
@@ -172,7 +179,6 @@ class VectorGraphicsScene(nn.Module):
             )
             if closed_g.means.shape[0] > 0:
                 all_gaussians.append(closed_g)
-                # Per-curve area using true enclosed area (not bounding box)
                 bcp_px = bcp * torch.tensor([W, H], device=bcp.device, dtype=bcp.dtype)
                 areas = closed_curve_enclosed_area(bcp_px)  # (N,)
                 R_total = self.closed_sampler.num_intermediate + 2
@@ -180,8 +186,7 @@ class VectorGraphicsScene(nn.Module):
                 curve_areas.append((areas, R_total * K))
 
         if len(all_gaussians) == 0:
-            device = self.open_control_points.device if self.n_open > 0 else self.closed_boundary_cp.device
-            return torch.ones(3, H, W, device=device)
+            return None
 
         # Concatenate all Gaussians
         if len(all_gaussians) == 1:
@@ -192,17 +197,14 @@ class VectorGraphicsScene(nn.Module):
                 combined = combined.concat(g)
 
         # ── Per-curve depth sort (paper Sec 3.3) ──
-        # All Gaussians from the same curve share the same depth.
-        # Smallest-area curves are frontmost (index 0 in front-to-back compositing).
         all_areas_list = []
         for areas, gaussians_per_curve in curve_areas:
-            # Expand curve area to each Gaussian from that curve
             expanded = areas.unsqueeze(1).expand(-1, gaussians_per_curve).reshape(-1)
             all_areas_list.append(expanded)
         all_areas = torch.cat(all_areas_list, dim=0)
 
         sort_indices = torch.argsort(all_areas, descending=False)
-        combined = GaussianParams(
+        return GaussianParams(
             means=combined.means[sort_indices],
             scales=combined.scales[sort_indices],
             rotations=combined.rotations[sort_indices],
@@ -211,4 +213,14 @@ class VectorGraphicsScene(nn.Module):
             curve_ids=combined.curve_ids[sort_indices],
         )
 
-        return rasterize(combined, H, W)
+    def forward(self, H: int | None = None, W: int | None = None) -> Tensor:
+        """Render the scene."""
+        H = H or self.H
+        W = W or self.W
+
+        gaussians = self.get_gaussians(H, W)
+        if gaussians is None:
+            device = self.open_control_points.device if self.n_open > 0 else self.closed_shared_pts.device
+            return torch.ones(3, H, W, device=device)
+
+        return rasterize(gaussians, H, W)

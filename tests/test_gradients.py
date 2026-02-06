@@ -70,8 +70,10 @@ class TestGradientFlow:
         loss = F.mse_loss(rendered, target)
         loss.backward()
 
-        assert scene.closed_boundary_cp.grad is not None
-        assert scene.closed_boundary_cp.grad.abs().max() > 0, "No gradient on closed curve CPs"
+        assert scene.closed_shared_pts.grad is not None
+        assert scene.closed_shared_pts.grad.abs().max() > 0, "No gradient on shared endpoints"
+        assert scene.closed_interior_cp.grad is not None
+        assert scene.closed_interior_cp.grad.abs().max() > 0, "No gradient on interior CPs"
 
 
 class TestRasterizerDifferentiable:
