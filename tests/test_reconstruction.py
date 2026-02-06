@@ -11,12 +11,18 @@ Thresholds are tiered:
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 
 import torch
 import pytest
 
+from bezier_splatting.debug.samples import (
+    generate_circle,
+    generate_composition,
+    generate_gradient,
+    generate_overlap,
+    generate_strokes,
+)
 from bezier_splatting.metrics import compute_metrics
 from bezier_splatting.optimization import fit_image
 from bezier_splatting.svg import scene_to_svg
@@ -78,138 +84,14 @@ TARGET_CONFIGS = {
 FAST_TARGETS = ["circle", "strokes"]
 
 
-# ── Programmatic target generation ──
-
-def _generate_circle(H: int = TEST_RESOLUTION, W: int = TEST_RESOLUTION) -> torch.Tensor:
-    """Red filled circle on white background."""
-    img = torch.ones(3, H, W)
-    y, x = torch.meshgrid(
-        torch.arange(H, dtype=torch.float32),
-        torch.arange(W, dtype=torch.float32),
-        indexing="ij",
-    )
-    cx, cy, r = W / 2, H / 2, min(H, W) / 4
-    mask = ((x - cx) ** 2 + (y - cy) ** 2) < r ** 2
-    img[0, mask] = 1.0  # red
-    img[1, mask] = 0.0
-    img[2, mask] = 0.0
-    return img
-
-
-def _generate_overlap(H: int = TEST_RESOLUTION, W: int = TEST_RESOLUTION) -> torch.Tensor:
-    """3 semi-transparent colored rectangles overlapping."""
-    img = torch.ones(3, H, W)
-
-    # Scale rectangle coords to resolution (designed for 256, scale down)
-    s = H / 256
-    rects = [
-        # (y0, x0, y1, x1, color, opacity)
-        (int(40*s), int(40*s), int(160*s), int(160*s), torch.tensor([1.0, 0.0, 0.0]), 0.5),   # red
-        (int(80*s), int(80*s), int(200*s), int(200*s), torch.tensor([0.0, 1.0, 0.0]), 0.5),   # green
-        (int(60*s), int(100*s), int(180*s), int(220*s), torch.tensor([0.0, 0.0, 1.0]), 0.5),  # blue
-    ]
-
-    for y0, x0, y1, x1, color, alpha in rects:
-        for c in range(3):
-            img[c, y0:y1, x0:x1] = img[c, y0:y1, x0:x1] * (1 - alpha) + color[c] * alpha
-
-    return img
-
-
-def _generate_strokes(H: int = TEST_RESOLUTION, W: int = TEST_RESOLUTION) -> torch.Tensor:
-    """Star pattern: 8 lines radiating from center, varying thickness."""
-    img = torch.ones(3, H, W)
-    cx, cy = W / 2, H / 2
-    length = min(H, W) * 0.4
-
-    y_coords, x_coords = torch.meshgrid(
-        torch.arange(H, dtype=torch.float32),
-        torch.arange(W, dtype=torch.float32),
-        indexing="ij",
-    )
-
-    for i in range(8):
-        angle = i * math.pi / 4
-        dx = math.cos(angle)
-        dy = math.sin(angle)
-        thickness = 1.0 + (i % 4)  # 1-4 pixel thickness
-
-        # Distance from point to line through center in direction (dx, dy)
-        # For pixel (x, y), distance to line = |(x-cx)*dy - (y-cy)*dx|
-        dist_to_line = abs((x_coords - cx) * dy - (y_coords - cy) * dx)
-        # Also constrain to line segment length
-        proj = (x_coords - cx) * dx + (y_coords - cy) * dy
-        on_segment = (proj >= 0) & (proj <= length)
-
-        mask = (dist_to_line < thickness) & on_segment
-        img[0, mask] = 0.2
-        img[1, mask] = 0.2
-        img[2, mask] = 0.2
-
-    return img
-
-
-def _generate_gradient(H: int = TEST_RESOLUTION, W: int = TEST_RESOLUTION) -> torch.Tensor:
-    """Linear gradient from blue (left) to orange (right)."""
-    t = torch.linspace(0, 1, W).unsqueeze(0).expand(H, W)  # (H, W)
-    img = torch.zeros(3, H, W)
-
-    # Blue = (0.1, 0.2, 0.8), Orange = (1.0, 0.6, 0.1)
-    blue = torch.tensor([0.1, 0.2, 0.8])
-    orange = torch.tensor([1.0, 0.6, 0.1])
-
-    for c in range(3):
-        img[c] = blue[c] * (1 - t) + orange[c] * t
-
-    return img
-
-
-def _generate_composition(H: int = TEST_RESOLUTION, W: int = TEST_RESOLUTION) -> torch.Tensor:
-    """Multi-shape: 3 filled shapes + 5 strokes + gradient background."""
-    # Start with gradient background
-    img = _generate_gradient(H, W)
-
-    y_coords, x_coords = torch.meshgrid(
-        torch.arange(H, dtype=torch.float32),
-        torch.arange(W, dtype=torch.float32),
-        indexing="ij",
-    )
-
-    # Scale factor (designed for 256)
-    s = H / 256
-
-    # 3 filled shapes (scaled)
-    shapes = [
-        ((64*s, 64*s), 30*s, torch.tensor([0.9, 0.1, 0.1])),    # red circle
-        ((192*s, 64*s), 25*s, torch.tensor([0.1, 0.9, 0.1])),    # green circle
-        ((128*s, 192*s), 35*s, torch.tensor([0.9, 0.9, 0.1])),   # yellow circle
-    ]
-    for (cy, cx), r, color in shapes:
-        mask = ((x_coords - cx) ** 2 + (y_coords - cy) ** 2) < r ** 2
-        alpha = 0.8
-        for c in range(3):
-            img[c, mask] = img[c, mask] * (1 - alpha) + color[c] * alpha
-
-    # 5 strokes (scaled)
-    for i in range(5):
-        y0 = (30 + i * 40) * s
-        x0 = 20 * s
-        x1 = W - 20 * s
-        thickness = max(1.0, 2.0 * s)
-        mask = (y_coords >= y0 - thickness) & (y_coords <= y0 + thickness) & (x_coords >= x0) & (x_coords <= x1)
-        gray = 0.1 + i * 0.15
-        for c in range(3):
-            img[c, mask] = gray
-
-    return img.clamp(0, 1)
-
+# ── Programmatic target generation (imported from debug.samples) ──
 
 GENERATORS = {
-    "circle": _generate_circle,
-    "overlap": _generate_overlap,
-    "strokes": _generate_strokes,
-    "gradient": _generate_gradient,
-    "composition": _generate_composition,
+    "circle": generate_circle,
+    "overlap": generate_overlap,
+    "strokes": generate_strokes,
+    "gradient": generate_gradient,
+    "composition": generate_composition,
 }
 
 
@@ -237,6 +119,9 @@ def target_config(request):
     config = TARGET_CONFIGS[name].copy()
     if fast:
         config["steps"] = config["steps"] // 2
+
+    # Fixed seed per target for reproducible results across runs
+    torch.manual_seed(hash(name) % 2**32)
 
     target = GENERATORS[name]()
     return name, target, config
