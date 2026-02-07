@@ -294,23 +294,12 @@ def _xing_loss_cubic(
 
 
 def xing_loss(scene: VectorGraphicsScene) -> Float[Tensor, ""]:
-    """Total Xing loss for all curves in the scene.
+    """Total Xing loss for closed curves in the scene.
 
-    Open curves: 3 cubic segments each (CPs [0:4], [3:7], [6:10]).
     Closed curves: 1 cubic per boundary x 2 boundaries (when 4 CPs),
-        or sliding window of cubics for higher-order boundaries.
+    or sliding window of cubics for higher-order boundaries.
     """
     losses: list[Tensor] = []
-
-    # Open curves: 3 segments per curve
-    if scene.n_open > 0:
-        cp = scene.open_control_points  # (N, 10, 2)
-        for seg_start in [0, 3, 6]:
-            loss = _xing_loss_cubic(
-                cp[:, seg_start], cp[:, seg_start + 1],
-                cp[:, seg_start + 2], cp[:, seg_start + 3],
-            )
-            losses.append(loss)
 
     # Closed curves: per-boundary cubics
     if scene.n_closed > 0:
@@ -375,8 +364,8 @@ def compute_loss(
     if collect_loss_dict:
         loss_dict["reconstruction"] = recon.item()
 
-    # Xing loss
-    if config.lambda_xing > 0:
+    # Xing loss (closed curves only)
+    if config.lambda_xing > 0 and scene.n_closed > 0:
         xing = xing_loss(scene)
         total = total + config.lambda_xing * xing
         if collect_loss_dict:
