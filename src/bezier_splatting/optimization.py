@@ -283,7 +283,8 @@ def fit_image(
         samples_per_closed_curve: Optional override for per-row closed sample count.
         num_intermediate: Optional override for closed interior row count.
         raster_backend: Rasterizer backend (``"auto"``, ``"pytorch"``, ``"gsplat"``).
-            ``"auto"`` prefers gsplat on CUDA, falls back to pytorch.
+            ``"auto"`` prefers gsplat and requires it on CUDA.
+            Use explicit ``"pytorch"`` to force the slower fallback.
             ``"reference"`` and ``"mps"`` are accepted as aliases for ``"pytorch"``.
         raster_tile_size: Tile size used by the rasterizer.
         raster_chunk_size: Chunk size used by the rasterizer.

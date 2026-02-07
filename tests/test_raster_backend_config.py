@@ -95,13 +95,12 @@ def test_gsplat_not_installed_raises_clear_error():
             _resolve_backend("gsplat", cuda)
 
 
-def test_auto_backend_on_cuda_warns_when_gsplat_missing():
-    """Auto backend warns before falling back to pytorch on CUDA without gsplat."""
+def test_auto_backend_on_cuda_requires_gsplat():
+    """Auto backend raises when CUDA is selected but gsplat is unavailable."""
     cuda = torch.device("cuda")
     with patch("bezier_splatting.rasterizer._check_gsplat", return_value=False):
-        with pytest.warns(RuntimeWarning, match="resolved to `pytorch` on CUDA"):
-            resolved = _resolve_backend("auto", cuda)
-    assert resolved == "pytorch"
+        with pytest.raises(ImportError, match="`auto` on CUDA requires `gsplat`"):
+            _resolve_backend("auto", cuda)
 
 
 def test_auto_backend_on_cuda_no_warning_when_gsplat_available():
@@ -113,6 +112,16 @@ def test_auto_backend_on_cuda_no_warning_when_gsplat_available():
             resolved = _resolve_backend("auto", cuda)
     assert resolved == "gsplat"
     assert len(record) == 0
+
+
+def test_explicit_pytorch_backend_on_cuda_warns_and_resolves():
+    """Explicit pytorch backend on CUDA should warn but still proceed."""
+    cuda = torch.device("cuda")
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        resolved = _resolve_backend("pytorch", cuda)
+    assert resolved == "pytorch"
+    assert any("selected explicitly on CUDA" in str(w.message) for w in record)
 
 
 def test_unknown_backend_raises_value_error():

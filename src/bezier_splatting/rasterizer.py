@@ -103,17 +103,21 @@ def _resolve_backend(backend: RasterBackend, device: torch.device) -> str:
         if device.type == "cuda":
             if _check_gsplat():
                 return "gsplat"
-            warnings.warn(
-                "Raster backend `auto` resolved to `pytorch` on CUDA because `gsplat` is unavailable. "
-                "This can be significantly slower and may use more memory. "
+            raise ImportError(
+                "Raster backend `auto` on CUDA requires `gsplat`, but it is not installed. "
                 "Install `gsplat` (e.g. `uv sync --extra cuda` or `pip install gsplat`) "
-                "or set backend explicitly.",
-                RuntimeWarning,
-                stacklevel=2,
+                "or explicitly set backend='pytorch' to force the slower fallback.",
             )
         return "pytorch"
 
     if backend in {"pytorch", "mps", "reference"}:
+        if device.type == "cuda":
+            warnings.warn(
+                "Raster backend `pytorch` was selected explicitly on CUDA. "
+                "This fallback is typically slower and may use more memory than `gsplat`.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return "pytorch"
 
     if backend in {"gsplat", "cuda_gsplat"}:
