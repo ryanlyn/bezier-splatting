@@ -293,17 +293,25 @@ def _xing_loss_cubic(
     return loss
 
 
-def xing_loss(scene: VectorGraphicsScene) -> Float[Tensor, ""]:
+def xing_loss(
+    scene: VectorGraphicsScene,
+    boundary_cp: Float[Tensor, "N 2 CP 2"] | None = None,
+) -> Float[Tensor, ""]:
     """Total Xing loss for closed curves in the scene.
 
     Closed curves: 1 cubic per boundary x 2 boundaries (when 4 CPs),
     or sliding window of cubics for higher-order boundaries.
+
+    Args:
+        scene: The scene (used for n_closed and as fallback for boundary CPs).
+        boundary_cp: Pre-computed closed_boundary_cp to avoid redundant assembly.
+            If None, fetched from scene.closed_boundary_cp.
     """
     losses: list[Tensor] = []
 
     # Closed curves: per-boundary cubics
     if scene.n_closed > 0:
-        bcp = scene.closed_boundary_cp  # (N, 2, num_cp, 2)
+        bcp = boundary_cp if boundary_cp is not None else scene.closed_boundary_cp
         num_cp = bcp.shape[2]
         if num_cp == 4:
             for b in range(2):
@@ -358,6 +366,15 @@ def compute_loss(
     device = rendered.device
     loss_dict: dict[str, float] = {}
 
+    # Cache closed_boundary_cp once if any loss term needs it
+    needs_bcp = scene.n_closed > 0 and (
+        config.lambda_xing > 0
+        or (config.apply_shape_reg and config.lambda_shape > 0)
+        or (config.apply_curvature and config.lambda_curvature > 0)
+        or (config.apply_boundary and config.lambda_boundary > 0)
+    )
+    bcp = scene.closed_boundary_cp if needs_bcp else None
+
     # Reconstruction loss (always applied)
     recon = reconstruction_loss(rendered, target, config.loss_type)
     total = recon
@@ -366,14 +383,13 @@ def compute_loss(
 
     # Xing loss (closed curves only)
     if config.lambda_xing > 0 and scene.n_closed > 0:
-        xing = xing_loss(scene)
+        xing = xing_loss(scene, boundary_cp=bcp)
         total = total + config.lambda_xing * xing
         if collect_loss_dict:
             loss_dict["xing"] = xing.item()
 
     # Shape regularizer (closed curves only)
     if config.apply_shape_reg and config.lambda_shape > 0 and scene.n_closed > 0:
-        bcp = scene.closed_boundary_cp  # (N, 2, CP, 2)
         # Apply to each boundary independently
         b0_loss = shape_regularizer(bcp[:, 0, :, :])
         b1_loss = shape_regularizer(bcp[:, 1, :, :])
@@ -392,7 +408,6 @@ def compute_loss(
     # Curvature loss (closed curves only)
     if config.apply_curvature and config.lambda_curvature > 0 and scene.n_closed > 0:
         _, H, W = target.shape
-        bcp = scene.closed_boundary_cp
         curv_loss = curvature_loss(bcp, H, W)
         total = total + config.lambda_curvature * curv_loss
         if collect_loss_dict:
@@ -404,7 +419,6 @@ def compute_loss(
         if scene.n_open > 0:
             joint_losses.append(boundary_joint_loss(scene.open_control_points, degree=3))
         if scene.n_closed > 0:
-            bcp = scene.closed_boundary_cp
             joint_losses.append(boundary_joint_loss(bcp[:, 0, :, :], degree=3))
             joint_losses.append(boundary_joint_loss(bcp[:, 1, :, :], degree=3))
         if joint_losses:

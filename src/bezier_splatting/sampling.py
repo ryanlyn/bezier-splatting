@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import math
 
 import torch
+import torch.nn.functional as F
 from jaxtyping import Float, Int
 from torch import Tensor
 
@@ -47,12 +48,10 @@ def _central_diff_angles(points: Float[Tensor, "*batch K 2"]) -> Float[Tensor, "
     Returns:
         angles: (..., K) rotation in radians.
     """
-    # Interior: (X_{k+1} - X_{k-1})
-    central = points[..., 2:, :] - points[..., :-2, :]  # (..., K-2, 2)
-    # Boundary: forward diff at k=0, backward diff at k=K-1
-    fwd = points[..., 1:2, :] - points[..., 0:1, :]     # (..., 1, 2)
-    bwd = points[..., -1:, :] - points[..., -2:-1, :]    # (..., 1, 2)
-    diffs = torch.cat([fwd, central, bwd], dim=-2)       # (..., K, 2)
+    # Replicate-pad K dim by 1 on each side so central diffs naturally
+    # become forward diff at k=0 and backward diff at k=K-1.
+    padded = F.pad(points, (0, 0, 1, 1), mode='replicate')  # (..., K+2, 2)
+    diffs = padded[..., 2:, :] - padded[..., :-2, :]        # (..., K, 2)
     return torch.atan2(diffs[..., 1], diffs[..., 0])
 
 
@@ -197,11 +196,8 @@ class OpenCurveSampler:
         # Per-segment opacity: assign each sample to the segment it was
         # generated from.  Uses the same partition as evaluate_composite_bezier.
         seg_sizes = composite_segment_sizes(K)
-        opacity_per_sample = torch.zeros(N, K, device=device)
-        k = 0
-        for seg, n_seg in enumerate(seg_sizes):
-            opacity_per_sample[:, k:k + n_seg] = opacities[:, seg:seg + 1].expand(-1, n_seg)
-            k += n_seg
+        seg_sizes_t = torch.tensor(seg_sizes, device=device)
+        opacity_per_sample = torch.repeat_interleave(opacities, seg_sizes_t, dim=1)
 
         # Flatten (N, K) → (N*K,)
         means = points.reshape(-1, 2)
@@ -246,6 +242,12 @@ class ClosedCurveSampler:
         self.rho = rho
         self.boundary_bias = boundary_bias
         self.sampling_mode = sampling_mode
+        # Pre-compute interior weights (deterministic, depends only on R/mode/bias)
+        self._interior_weights_cpu = _closed_interior_weights(
+            num_intermediate, sampling_mode, boundary_bias,
+            dtype=torch.float32, device=torch.device("cpu"),
+        )
+        self._interior_weights_cache: Tensor | None = None
 
     def __call__(
         self,
@@ -282,13 +284,14 @@ class ClosedCurveSampler:
         #   row 0 -> top boundary
         #   row 1 -> bottom boundary
         #   rows 2.. -> interior interpolated curves
-        interior_w = _closed_interior_weights(
-            R,
-            self.sampling_mode,
-            self.boundary_bias,
-            boundary_cp.dtype,
-            device,
-        )  # (R,)
+        # Use pre-computed weights, moving to correct device/dtype on first use
+        cache = self._interior_weights_cache
+        if cache is None or cache.device != device or cache.dtype != boundary_cp.dtype:
+            self._interior_weights_cache = self._interior_weights_cpu.to(
+                device=device, dtype=boundary_cp.dtype,
+            )
+            cache = self._interior_weights_cache
+        interior_w = cache  # (R,)
 
         if R > 0:
             w = interior_w[None, :, None, None]  # (1, R, 1, 1)

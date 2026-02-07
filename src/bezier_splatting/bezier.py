@@ -128,25 +128,36 @@ def evaluate_composite_bezier(
         control_points[:, 6:10, :],
     ], dim=1)  # (num_curves, 3, 4, 2)
 
-    all_points = []
-    all_tangents = [] if compute_tangents else None
+    # Build a single t tensor of length K by concatenating per-segment linspaces.
+    # Segment 0: linspace(0, 1, n0)
+    # Segments 1, 2: linspace(0, 1, n+1)[1:] to skip shared endpoint at t=0
+    t_parts = []
+    seg_indices = []
     for seg_idx in range(3):
         n = seg_sizes[seg_idx]
         if n == 0:
             continue
-        # Avoid duplicating shared endpoints: skip t=0 for segments 1,2
         if seg_idx == 0:
-            t = torch.linspace(0, 1, n, device=control_points.device, dtype=control_points.dtype)
+            t_seg = torch.linspace(0, 1, n, device=control_points.device, dtype=control_points.dtype)
         else:
-            t = torch.linspace(0, 1, n + 1, device=control_points.device, dtype=control_points.dtype)[1:]
+            t_seg = torch.linspace(0, 1, n + 1, device=control_points.device, dtype=control_points.dtype)[1:]
+        t_parts.append(t_seg)
+        seg_indices.append(torch.full((n,), seg_idx, device=control_points.device, dtype=torch.long))
 
-        cp = seg_cps[:, seg_idx]  # (num_curves, 4, 2)
-        pts = evaluate_bezier(cp, t)  # (num_curves, n, 2)
-        all_points.append(pts)
-        if compute_tangents:
-            tng = bezier_tangent(cp, t)   # (num_curves, n, 2)
-            all_tangents.append(tng)
+    t_all = torch.cat(t_parts)          # (K,)
+    seg_map = torch.cat(seg_indices)     # (K,) — which segment each sample belongs to
 
-    points = torch.cat(all_points, dim=1)    # (num_curves, ~num_samples, 2)
-    tangents = torch.cat(all_tangents, dim=1) if compute_tangents else None
+    # Gather CPs for each sample: seg_cps[:, seg_map] → (N, K, 4, 2)
+    cp_per_sample = seg_cps[:, seg_map]  # (N, K, 4, 2)
+
+    # Evaluate all samples in one batched call via Bernstein basis
+    basis = bernstein_basis(t_all, 3)    # (K, 4)
+    points = torch.einsum("sd,nsdx->nsx", basis, cp_per_sample)  # (N, K, 2)
+
+    tangents = None
+    if compute_tangents:
+        delta_cp = cp_per_sample[:, :, 1:, :] - cp_per_sample[:, :, :-1, :]  # (N, K, 3, 2)
+        basis_d = bernstein_basis(t_all, 2)  # (K, 3)
+        tangents = 3 * torch.einsum("sd,nsdx->nsx", basis_d, delta_cp)  # (N, K, 2)
+
     return points, tangents

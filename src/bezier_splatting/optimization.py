@@ -208,6 +208,7 @@ def fit_image(
     prune_config: PruneConfig | None = None,
     loss_config: LossConfig | None = None,
     callback: Callable[[int, float, VectorGraphicsScene], None] | None = None,
+    torch_compile: bool | str = False,
     debug: bool | str = False,
 ) -> VectorGraphicsScene:
     """Optimize a VectorGraphicsScene to reconstruct a target image.
@@ -264,6 +265,11 @@ def fit_image(
             ``loss_preset`` policy is used.
         callback: Optional callback(step, loss, scene) for monitoring.
             If the callback returns ``False``, training stops early.
+        torch_compile: Enable ``torch.compile`` for the forward pass (CUDA
+            only). ``False`` disables (default). ``True`` or ``"default"``
+            uses default mode. ``"reduce-overhead"`` and ``"max-autotune"``
+            select the corresponding compile modes. Dynamo automatically
+            re-traces after topology operations that change parameter shapes.
         debug: When truthy, activate debug logging. When a string, use it as
             the output directory (default ``"debug_output"``).
 
@@ -416,6 +422,19 @@ def fit_image(
         raster_chunk_size=raster_chunk_size,
     ).to(device)
 
+    # TF32 matmul on CUDA — free ~5% speedup with negligible quality impact
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+
+    # torch.compile for the forward pass (CUDA only)
+    compiled_forward: VectorGraphicsScene | None = None
+    if torch_compile and device.type == "cuda":
+        if torch_compile is True or torch_compile == "default":
+            compile_mode = "default"
+        else:
+            compile_mode = str(torch_compile)
+        compiled_forward = torch.compile(scene, mode=compile_mode)
+
     param_groups = _build_param_groups(scene, H, W, lr_scale=lr_scale)
     optimizer = _build_optimizer(param_groups, optimizer_type)
 
@@ -429,11 +448,17 @@ def fit_image(
             for group in optimizer.param_groups:
                 group["lr"] *= lr_gamma
 
-        scene.iter = step
+        # Depth heuristic schedule:
+        # - Closed curves: AABB area overwritten every forward pass
+        # - Open curves: polyline length * stroke width every 20 steps for first 10k
+        update_open = step < 10000 and step % 20 == 0
+        if scene.n_closed > 0 or (scene.n_open > 0 and update_open):
+            scene.update_depth_heuristic(H, W, update_open=update_open, update_closed=True)
 
         optimizer.zero_grad()
 
-        rendered = scene(H, W)
+        forward_fn = compiled_forward if compiled_forward is not None else scene
+        rendered = forward_fn(H, W)
         collect_loss_dict = debug or step % log_every == 0
         loss, loss_dict = compute_loss(
             rendered,
