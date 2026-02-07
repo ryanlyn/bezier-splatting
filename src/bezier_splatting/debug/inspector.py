@@ -627,7 +627,10 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
             ["minimal", "standard", "full"], value="standard", label="Layout"
         )
         anim_fps = gr.Slider(5, 30, value=10, step=1, label="FPS")
-        export_btn = gr.Button("Export GIF", interactive=False)
+        with gr.Row():
+            export_btn = gr.Button("Export GIF", interactive=False)
+            load_frames_btn = gr.Button("Load Previous Run")
+        anim_status = gr.Markdown("")
         anim_file = gr.File(label="Download GIF")
 
     # Shared mutable state for stop signaling across Gradio threads.
@@ -834,27 +837,11 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
             capture = _LogCapture(sys.stdout, log_lines)
             sys.stdout = capture
             try:
-                # Scale topology schedule for short runs.  The defaults
-                # (topology_start_step=1000, prune_stop_before_end=1000)
-                # assume 15k steps.  For the interactive debugger we scale
-                # proportionally so pruning/densification still fires.
-                ref_steps = 15000
-                topo_start = max(100, int(1000 * steps / ref_steps))
-                prune_stop = max(100, int(1000 * steps / ref_steps))
-                prune_every = max(50, int(400 * steps / ref_steps))
-                # Ensure the window [topo_start, steps - prune_stop) is non-empty
-                if topo_start >= steps - prune_stop:
-                    topo_start = max(1, steps // 4)
-                    prune_stop = max(1, steps // 4)
-
                 result_holder[0] = fit_image(
                     target,
                     n_open=n_open,
                     n_closed=n_closed,
                     steps=steps,
-                    prune_every=prune_every,
-                    prune_stop_before_end=prune_stop,
-                    topology_start_step=topo_start,
                     log_every=max(1, steps // 40),
                     lr_scale=lr_scale,
                     callback=callback,
@@ -983,6 +970,10 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
                 (final_error_np, "Error Heatmap"),
             ]
 
+            # Auto-save frame data for deferred GIF export
+            if recorder.frame_count > 0:
+                recorder.save(output_dir / "animation_frames.pt")
+
             # Update shared app state
             app_state["output_dir"] = output_dir
             app_state["scan"] = _scan_output_dir(output_dir)
@@ -1039,16 +1030,53 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         """Export the recorded training frames as an animated GIF."""
         recorder = state.get("recorder")
         if recorder is None or recorder.frame_count == 0:
-            return None
+            return None, "*No frames to export.*"
         recorder._config = AnimationConfig(layout=layout, fps=int(fps))
         gif_dir = Path(tempfile.mkdtemp(prefix="bezier_gif_"))
         path = recorder.export(gif_dir / "training.gif")
-        return str(path)
+        return str(path), f"*Exported {recorder.frame_count} frames.*"
 
     export_btn.click(
         fn=export_gif,
         inputs=[train_state, anim_layout, anim_fps],
-        outputs=[anim_file],
+        outputs=[anim_file, anim_status],
+    )
+
+    def load_previous_frames(state, output_dir_str, layout, fps):
+        """Load saved frame data from a previous training run."""
+        # Try the current output dir, then fall back to CLI-provided dir
+        candidates = []
+        if output_dir_str:
+            candidates.append(Path(output_dir_str) / "animation_frames.pt")
+        if app_state.get("output_dir"):
+            candidates.append(Path(app_state["output_dir"]) / "animation_frames.pt")
+
+        frames_path = None
+        for c in candidates:
+            if c.exists():
+                frames_path = c
+                break
+
+        if frames_path is None:
+            return state, None, "*No saved frames found.* Run training first (frames are auto-saved).", gr.update()
+
+        config = AnimationConfig(layout=layout, fps=int(fps))
+        recorder = FrameRecorder.load(frames_path, config)
+        state["recorder"] = recorder
+
+        gif_dir = Path(tempfile.mkdtemp(prefix="bezier_gif_"))
+        path = recorder.export(gif_dir / "training.gif")
+        return (
+            state,
+            str(path),
+            f"*Loaded {recorder.frame_count} frames from `{frames_path.parent}`.*",
+            gr.update(interactive=True),
+        )
+
+    load_frames_btn.click(
+        fn=load_previous_frames,
+        inputs=[train_state, output_dir_state, anim_layout, anim_fps],
+        outputs=[train_state, anim_file, anim_status, export_btn],
     )
 
     # Generate initial preview on app load
