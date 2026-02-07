@@ -480,7 +480,19 @@ def fit_image(
 
         if step % log_every == 0:
             recon_val = loss_dict.get("reconstruction", loss_val)
-            print(f"Step {step:5d}/{steps} | loss={loss_val:.6f} | recon={recon_val:.6f}")
+            psnr_str = ""
+            if debug:
+                psnr_str = f" | PSNR={psnr_val:.1f}dB"
+            terms = " ".join(
+                f"{k}={v:.4f}"
+                for k, v in loss_dict.items()
+                if k not in ("total", "reconstruction")
+            )
+            terms_str = f" | {terms}" if terms else ""
+            print(
+                f"Step {step:5d}/{steps} | loss={loss_val:.6f} | recon={recon_val:.6f}"
+                f"{psnr_str} | {scene.n_open}o+{scene.n_closed}c{terms_str}"
+            )
 
         if callback is not None:
             if callback(step, loss_val, scene) is False:
@@ -499,6 +511,7 @@ def fit_image(
         if topology_schedule == "unified":
             if should_topology:
                 did_topology = True
+                pre_open, pre_closed = scene.n_open, scene.n_closed
                 if debug:
                     pre_prune = snapshot_scene(scene)
                 with torch.no_grad():
@@ -515,6 +528,10 @@ def fit_image(
                         do_prune=True,
                         do_densify=True,
                     )
+                print(
+                    f"  [TOPOLOGY] step {step}: prune+densify | "
+                    f"{pre_open}o+{pre_closed}c -> {scene.n_open}o+{scene.n_closed}c"
+                )
         elif topology_schedule == "alternating":
             hard_stop = (
                 topology_max_step_closed if scene.n_closed > 0 else topology_max_step_open
@@ -528,6 +545,7 @@ def fit_image(
                 phase = (step // prune_every) % 2
                 if phase == 1:
                     did_topology = True
+                    pre_open, pre_closed = scene.n_open, scene.n_closed
                     if debug:
                         pre_prune = snapshot_scene(scene)
                     with torch.no_grad():
@@ -545,8 +563,13 @@ def fit_image(
                             do_densify=False,
                         )
                     pending_densify += pruned_count
+                    print(
+                        f"  [PRUNE] step {step}: removed {pruned_count} | "
+                        f"{pre_open}o+{pre_closed}c -> {scene.n_open}o+{scene.n_closed}c"
+                    )
                 elif pending_densify > 0:
                     did_topology = True
+                    pre_open, pre_closed = scene.n_open, scene.n_closed
                     if debug:
                         pre_prune = snapshot_scene(scene)
                     with torch.no_grad():
@@ -564,6 +587,10 @@ def fit_image(
                             do_densify=True,
                             densify_n_override=pending_densify,
                         )
+                    print(
+                        f"  [DENSIFY] step {step}: added {pending_densify} | "
+                        f"{pre_open}o+{pre_closed}c -> {scene.n_open}o+{scene.n_closed}c"
+                    )
                     pending_densify = 0
         else:
             raise ValueError(

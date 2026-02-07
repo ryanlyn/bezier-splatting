@@ -12,8 +12,8 @@ from bezier_splatting.debug.animation import (
     AnimationConfig,
     FrameData,
     FrameRecorder,
-    _build_capture_schedule,
     _compose_frame,
+    _downsample_frames,
     _tensor_to_uint8,
 )
 
@@ -78,25 +78,45 @@ class TestAnimationConfig:
 # ---------------------------------------------------------------------------
 
 
-class TestCaptureSchedule:
-    def test_always_includes_first_and_last(self):
-        schedule = _build_capture_schedule(total_steps=1000, target_frames=10)
-        assert 0 in schedule
-        assert 1000 in schedule
+class TestDownsampleFrames:
+    def _make_frames(self, n: int, event_at: set[int] | None = None) -> list[FrameData]:
+        """Create n dummy FrameData objects."""
+        event_at = event_at or set()
+        return [
+            FrameData(
+                step=i * 10, rendered=torch.rand(3, 4, 4),
+                loss=1.0 / (i + 1), psnr=10.0 + i,
+                n_open=2, n_closed=1,
+                event="prune" if i in event_at else None,
+            )
+            for i in range(n)
+        ]
 
-    def test_respects_target_frame_count(self):
-        schedule = _build_capture_schedule(total_steps=1000, target_frames=20)
-        # Should be close to target_frames (may differ slightly due to rounding)
-        assert len(schedule) <= 25
-        assert len(schedule) >= 15
+    def test_no_downsample_when_under_target(self):
+        frames = self._make_frames(5)
+        result = _downsample_frames(frames, target=10)
+        assert len(result) == 5
 
-    def test_zero_target_frames(self):
-        schedule = _build_capture_schedule(total_steps=100, target_frames=0)
-        assert len(schedule) == 0
+    def test_downsamples_to_target(self):
+        frames = self._make_frames(100)
+        result = _downsample_frames(frames, target=20)
+        assert len(result) <= 22  # target + first/last
+        assert result[0].step == 0
+        assert result[-1].step == frames[-1].step
 
-    def test_more_frames_than_steps(self):
-        schedule = _build_capture_schedule(total_steps=5, target_frames=100)
-        assert schedule == set(range(6))
+    def test_preserves_topology_events(self):
+        frames = self._make_frames(50, event_at={7, 23, 41})
+        result = _downsample_frames(frames, target=10)
+        event_steps = {f.step for f in result if f.event is not None}
+        assert 70 in event_steps   # step = 7 * 10
+        assert 230 in event_steps  # step = 23 * 10
+        assert 410 in event_steps  # step = 41 * 10
+
+    def test_keeps_first_and_last(self):
+        frames = self._make_frames(50)
+        result = _downsample_frames(frames, target=5)
+        assert result[0].step == frames[0].step
+        assert result[-1].step == frames[-1].step
 
 
 # ---------------------------------------------------------------------------
@@ -105,29 +125,31 @@ class TestCaptureSchedule:
 
 
 class TestFrameRecorderCapture:
-    def test_captures_first_and_last_step(self, target_tensor):
+    def test_captures_every_call(self, target_tensor):
         config = AnimationConfig(target_frames=5)
         rec = FrameRecorder(config, target_tensor, 16, 16)
-        total = 99
-        for step in range(total + 1):
+        for step in range(20):
             rec.maybe_capture(
-                step, total, torch.rand(3, 16, 16),
+                step, 19, torch.rand(3, 16, 16),
                 loss=0.5, psnr=20.0, n_open=2, n_closed=1,
             )
-        steps_captured = [f.step for f in rec._frames]
-        assert 0 in steps_captured
-        assert total in steps_captured
+        # Captures every call; downsampling happens at export time
+        assert rec.frame_count == 20
 
-    def test_frame_count_bounded(self, target_tensor):
-        config = AnimationConfig(target_frames=10)
+    def test_captures_sparse_calls(self, target_tensor):
+        """Simulates the inspector calling every display_every steps."""
+        config = AnimationConfig(target_frames=120)
         rec = FrameRecorder(config, target_tensor, 16, 16)
-        for step in range(500):
-            rec.maybe_capture(
-                step, 499, torch.rand(3, 16, 16),
-                loss=0.1, psnr=25.0, n_open=5, n_closed=2,
-            )
-        # Should be close to target_frames, not 500
-        assert rec.frame_count <= 15
+        total = 999
+        display_every = max(1, total // 40)
+        for step in range(total + 1):
+            if step % display_every == 0 or step == total:
+                rec.maybe_capture(
+                    step, total, torch.rand(3, 16, 16),
+                    loss=0.5, psnr=20.0, n_open=5, n_closed=2,
+                )
+        # Should have captured all ~41 callback calls, not just 2
+        assert rec.frame_count >= 30
 
     def test_topology_event_recorded(self, recorder):
         recorder.record_topology_event(5, "prune")
@@ -290,7 +312,9 @@ class TestGIFExport:
         meta = json.loads(json_path.read_text())
         assert meta["resolution"] == [16, 16]
         assert isinstance(meta["frames"], list)
-        assert len(meta["frames"]) == populated_recorder.frame_count
+        # Sidecar contains downsampled frames (target_frames=5), not raw count
+        assert len(meta["frames"]) > 0
+        assert len(meta["frames"]) <= populated_recorder.frame_count
         assert "step" in meta["frames"][0]
         assert "loss" in meta["frames"][0]
         assert "psnr" in meta["frames"][0]

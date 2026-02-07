@@ -6,7 +6,6 @@ GIF encoding — no external video dependencies (no imageio, no ffmpeg).
 """
 
 import json
-import math
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +50,7 @@ class FrameData:
     n_open: int
     n_closed: int
     event: str | None = None  # "prune" or "densify"
+    svg_overlay: np.ndarray | None = None  # (H, W, 3) uint8 SVG curve render
 
 
 class FrameRecorder:
@@ -59,9 +59,11 @@ class FrameRecorder:
     Call ``maybe_capture`` from the training loop. After training, call
     ``export`` to write an animated GIF.
 
-    The recorder uses logarithmic frame scheduling: early training steps
-    (where visual change is fastest) are sampled more densely than later
-    steps. This gives a natural "fast start, slow finish" feel.
+    The recorder captures every frame it receives and downsamples to
+    ``target_frames`` at export time. This is necessary because
+    ``maybe_capture`` is typically called at sparse intervals (e.g. every
+    ``display_every`` steps from the inspector), so a pre-computed capture
+    schedule would miss most calls.
     """
 
     def __init__(
@@ -77,10 +79,7 @@ class FrameRecorder:
         self._W = W
         self._frames: list[FrameData] = []
         self._lock = threading.Lock()
-        self._capture_steps: set[int] | None = None
         self._pending_event: str | None = None
-        self._all_losses: list[float] = []
-        self._all_psnrs: list[float] = []
 
     def maybe_capture(
         self,
@@ -91,23 +90,18 @@ class FrameRecorder:
         psnr: float,
         n_open: int,
         n_closed: int,
+        svg_overlay: np.ndarray | None = None,
     ) -> None:
-        """Capture a frame if this step is in the schedule.
+        """Capture a frame unconditionally.
 
         Thread-safe — safe to call from training threads. The rendered tensor
-        is detached and moved to CPU immediately.
+        is detached and moved to CPU immediately. Downsampling to
+        ``target_frames`` happens at export time.
+
+        Args:
+            svg_overlay: Optional (H, W, 3) uint8 numpy array of the SVG
+                curve overlay render. Included in standard/full layouts.
         """
-        self._all_losses.append(loss)
-        self._all_psnrs.append(psnr)
-
-        if self._capture_steps is None:
-            self._capture_steps = _build_capture_schedule(
-                total_steps, self._config.target_frames
-            )
-
-        if step not in self._capture_steps:
-            return
-
         frame = FrameData(
             step=step,
             rendered=rendered.detach().cpu().float(),
@@ -116,6 +110,7 @@ class FrameRecorder:
             n_open=n_open,
             n_closed=n_closed,
             event=self._pending_event,
+            svg_overlay=svg_overlay.copy() if svg_overlay is not None else None,
         )
         with self._lock:
             self._frames.append(frame)
@@ -139,24 +134,35 @@ class FrameRecorder:
         if not self._frames:
             raise ValueError("No frames captured — nothing to export")
 
+        # Downsample to target_frames if we captured more than needed.
+        # Always keep first, last, and any topology event frames.
+        frames = _downsample_frames(self._frames, self._config.target_frames)
+
         panel_size = self._config.panel_size
-        if panel_size is not None:
-            panel_size = max(panel_size, 128)
+        if panel_size is None:
+            # Default: scale up small training resolutions so GIF is readable.
+            # Target ~256px panels; leave high-res training as-is.
+            panel_size = max(256, self._H, self._W)
+        panel_size = max(panel_size, 128)
 
         pil_frames: list[Image.Image] = []
         json_frames: list[dict] = []
 
-        for i, frame in enumerate(self._frames):
+        # Build per-frame loss/psnr histories from captured frame data
+        all_losses = [f.loss for f in frames]
+        all_psnrs = [f.psnr for f in frames]
+
+        for i, frame in enumerate(frames):
             rendered_np = _tensor_to_uint8(frame.rendered)
-            losses_so_far = self._all_losses[: frame.step + 1]
-            psnrs_so_far = self._all_psnrs[: frame.step + 1]
+            losses_so_far = all_losses[: i + 1]
+            psnrs_so_far = all_psnrs[: i + 1]
 
             composed = _compose_frame(
                 layout=self._config.layout,
                 target_np=self._target_np,
                 rendered_np=rendered_np,
                 frame=frame,
-                total_steps=self._frames[-1].step,
+                total_steps=frames[-1].step,
                 losses=losses_so_far,
                 psnrs=psnrs_so_far,
                 panel_size=panel_size,
@@ -192,7 +198,7 @@ class FrameRecorder:
         sidecar = {
             "target": None,
             "resolution": [self._H, self._W],
-            "total_steps": self._frames[-1].step if self._frames else 0,
+            "total_steps": frames[-1].step if frames else 0,
             "fps": self._config.fps,
             "layout": self._config.layout,
             "frames": json_frames,
@@ -216,25 +222,53 @@ def _tensor_to_uint8(tensor: Tensor) -> np.ndarray:
     return (t.clamp(0, 1) * 255).byte().numpy()
 
 
-def _build_capture_schedule(total_steps: int, target_frames: int) -> set[int]:
-    """Build a set of steps to capture, spaced logarithmically.
+def _downsample_frames(frames: list[FrameData], target: int) -> list[FrameData]:
+    """Downsample frames to at most *target*, keeping first, last, and events.
 
-    Early steps are sampled more densely because visual change is fastest
-    at the start of optimization. Always includes step 0 and the final step.
+    Uses **logarithmic** spacing so the early (fast-changing) phase of
+    optimisation gets many more frames than the later (converged) phase.
+    If we have fewer than *target* frames, returns all of them.
     """
-    if target_frames <= 0:
-        return set()
-    if target_frames >= total_steps:
-        return set(range(total_steps + 1))
+    if len(frames) <= target:
+        return list(frames)
 
-    # Logarithmic spacing: more frames early, fewer late
-    log_steps = np.logspace(0, np.log10(total_steps + 1), target_frames, dtype=float)
-    steps = set(int(round(s - 1)) for s in log_steps)
-    steps.add(0)
-    steps.add(total_steps)
-    # Clamp to valid range
-    steps = {max(0, min(s, total_steps)) for s in steps}
-    return steps
+    n = len(frames)
+
+    # Always keep first, last, and topology-event frames
+    keep_indices: set[int] = {0, n - 1}
+    for i, f in enumerate(frames):
+        if f.event is not None:
+            keep_indices.add(i)
+
+    # Fill remaining budget with log-spaced indices.
+    # Exponential mapping gives dense coverage at the start (where changes
+    # are most dramatic) and sparse coverage toward convergence.
+    budget = target - len(keep_indices)
+    if budget > 0:
+        candidates = [i for i in range(n) if i not in keep_indices]
+        if candidates and budget < len(candidates):
+            import math
+            nc = len(candidates)
+            log_max = math.log1p(nc)
+            # Generate all unique candidate indices from log-spaced probes.
+            # Use nc*4 probes to avoid gaps from int() collisions.
+            probes = max(nc * 4, budget * 8)
+            selected_set: set[int] = set()
+            selected_order: list[int] = []
+            for j in range(probes):
+                t = j / max(probes - 1, 1)
+                idx = int(math.expm1(t * log_max))
+                idx = min(idx, nc - 1)
+                if idx not in selected_set:
+                    selected_set.add(idx)
+                    selected_order.append(candidates[idx])
+                    if len(selected_order) >= budget:
+                        break
+            keep_indices.update(selected_order)
+        else:
+            keep_indices.update(candidates)
+
+    return [frames[i] for i in sorted(keep_indices)]
 
 
 def _compute_error_map(rendered_np: np.ndarray, target_np: np.ndarray) -> np.ndarray:
@@ -403,6 +437,30 @@ def _compose_frame(
         raise ValueError(f"Unknown layout: {layout!r}. Use 'minimal', 'standard', or 'full'.")
 
 
+def _get_panels(
+    target_np: np.ndarray,
+    rendered_np: np.ndarray,
+    frame: FrameData,
+    panel_size: int | None,
+) -> list[np.ndarray]:
+    """Build the list of image panels for standard/full layouts.
+
+    Returns [target, rendered, error] or [target, rendered, error, svg] if
+    an SVG overlay is available. All panels are guaranteed to be the same size.
+    """
+    target_np = _resize_panel(target_np, panel_size)
+    rendered_np = _resize_panel(rendered_np, panel_size)
+    error_np = _compute_error_map(rendered_np, target_np)
+    panels = [target_np, rendered_np, error_np]
+    if frame.svg_overlay is not None:
+        # Force SVG to match the other panels' dimensions (the SVG overlay
+        # may arrive at a different resolution from _upscale_image).
+        h, w = target_np.shape[:2]
+        svg_pil = Image.fromarray(frame.svg_overlay).resize((w, h), Image.LANCZOS)
+        panels.append(np.array(svg_pil))
+    return panels
+
+
 def _compose_minimal(
     rendered_np: np.ndarray,
     frame: FrameData,
@@ -425,27 +483,21 @@ def _compose_standard(
     total_steps: int,
     panel_size: int | None,
 ) -> Image.Image:
-    """3-panel [target | rendered | error] with header bar."""
-    target_np = _resize_panel(target_np, panel_size)
-    rendered_np = _resize_panel(rendered_np, panel_size)
-    error_np = _compute_error_map(rendered_np, target_np)
-
-    ph, pw = rendered_np.shape[:2]
+    """Multi-panel [target | rendered | error | svg?] with header bar."""
+    panels = _get_panels(target_np, rendered_np, frame, panel_size)
+    n_panels = len(panels)
+    ph, pw = panels[0].shape[:2]
     gap = 2
-    total_w = pw * 3 + gap * 2
+    total_w = pw * n_panels + gap * (n_panels - 1)
     header_h = 28
     total_h = ph + header_h
 
     canvas = Image.new("RGB", (total_w, total_h), (30, 30, 30))
-
-    # Header
     header = _make_header_bar(total_w, frame, total_steps, bar_height=header_h)
     canvas.paste(header, (0, 0))
 
-    # Panels
-    canvas.paste(Image.fromarray(target_np), (0, header_h))
-    canvas.paste(Image.fromarray(rendered_np), (pw + gap, header_h))
-    canvas.paste(Image.fromarray(error_np), (2 * (pw + gap), header_h))
+    for i, panel in enumerate(panels):
+        canvas.paste(Image.fromarray(panel), (i * (pw + gap), header_h))
 
     return canvas
 
@@ -460,27 +512,21 @@ def _compose_full(
     panel_size: int | None,
 ) -> Image.Image:
     """Standard layout + loss chart row at the bottom."""
-    target_np = _resize_panel(target_np, panel_size)
-    rendered_np = _resize_panel(rendered_np, panel_size)
-    error_np = _compute_error_map(rendered_np, target_np)
-
-    ph, pw = rendered_np.shape[:2]
+    panels = _get_panels(target_np, rendered_np, frame, panel_size)
+    n_panels = len(panels)
+    ph, pw = panels[0].shape[:2]
     gap = 2
-    total_w = pw * 3 + gap * 2
+    total_w = pw * n_panels + gap * (n_panels - 1)
     header_h = 28
     chart_h = max(ph // 2, 100)
     total_h = ph + header_h + chart_h
 
     canvas = Image.new("RGB", (total_w, total_h), (30, 30, 30))
-
-    # Header
     header = _make_header_bar(total_w, frame, total_steps, bar_height=header_h)
     canvas.paste(header, (0, 0))
 
-    # Image panels
-    canvas.paste(Image.fromarray(target_np), (0, header_h))
-    canvas.paste(Image.fromarray(rendered_np), (pw + gap, header_h))
-    canvas.paste(Image.fromarray(error_np), (2 * (pw + gap), header_h))
+    for i, panel in enumerate(panels):
+        canvas.paste(Image.fromarray(panel), (i * (pw + gap), header_h))
 
     # Loss chart
     if len(losses) > 1:
