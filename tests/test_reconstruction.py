@@ -118,8 +118,8 @@ def target_config(request):
     if fast:
         config["steps"] = config["steps"] // 2
 
-    # Fixed seed per target for reproducible results across runs
-    torch.manual_seed(hash(name) % 2**32)
+    # Fixed seed for reproducible reconstruction quality across runs
+    torch.manual_seed(1)
 
     target = GENERATORS[name]()
     return name, target, config
@@ -137,6 +137,7 @@ class TestReconstruction:
                 n_closed=config["n_closed"],
                 steps=config["steps"],
                 log_every=config["steps"] // 10,
+                loss_preset="minimal",
             )
             rendered = scene(target.shape[1], target.shape[2]).detach()
             metrics = compute_metrics(rendered, target)

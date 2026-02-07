@@ -30,6 +30,13 @@ def save_checkpoint(
         "n_open": scene.n_open,
         "n_closed": scene.n_closed,
         "num_cp_closed": int(scene.closed_interior_cp.shape[2] + 2),
+        "samples_per_open": scene.open_sampler.samples_per_curve,
+        "samples_per_closed_curve": scene.closed_sampler.samples_per_curve,
+        "num_intermediate": scene.closed_sampler.num_intermediate,
+        "closed_sampling_mode": scene.closed_sampling_mode,
+        "raster_backend": scene.raster_backend,
+        "raster_tile_size": scene.raster_tile_size,
+        "raster_chunk_size": scene.raster_chunk_size,
     }
     torch.save(payload, path)
     return path

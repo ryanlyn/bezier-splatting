@@ -79,7 +79,13 @@ def _check_dead_curves(
 
         key = "open"
         if key not in dead_steps or dead_steps[key].shape[0] != scene.n_open:
-            dead_steps[key] = torch.zeros(scene.n_open, dtype=torch.long)
+            dead_steps[key] = torch.zeros(
+                scene.n_open,
+                dtype=torch.long,
+                device=open_max.device,
+            )
+        elif dead_steps[key].device != open_max.device:
+            dead_steps[key] = dead_steps[key].to(open_max.device)
 
         dead_steps[key][alive] = 0
         dead_steps[key][~alive] += 1
@@ -102,7 +108,13 @@ def _check_dead_curves(
 
         key = "closed"
         if key not in dead_steps or dead_steps[key].shape[0] != scene.n_closed:
-            dead_steps[key] = torch.zeros(scene.n_closed, dtype=torch.long)
+            dead_steps[key] = torch.zeros(
+                scene.n_closed,
+                dtype=torch.long,
+                device=closed_alive_score.device,
+            )
+        elif dead_steps[key].device != closed_alive_score.device:
+            dead_steps[key] = dead_steps[key].to(closed_alive_score.device)
 
         dead_steps[key][alive] = 0
         dead_steps[key][~alive] += 1

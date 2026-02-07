@@ -1,5 +1,7 @@
 """Tests for fit_image loss presets and topology schedule modes."""
 
+import math
+
 import torch
 import pytest
 
@@ -172,3 +174,46 @@ class TestTopologyScheduleModes:
 
         assert all(p == (True, True) for p in calls)
         assert len(calls) == 3  # steps 2, 4, 6
+
+
+class TestCallbackLossSyncControl:
+    def test_callback_can_skip_per_step_loss_values(self):
+        observed: list[tuple[int, float]] = []
+
+        def _callback(step: int, loss: float, _scene):
+            observed.append((step, loss))
+            return None
+
+        target = torch.rand(3, 16, 16)
+        _ = opt_mod.fit_image(
+            target,
+            n_open=1,
+            n_closed=0,
+            steps=5,
+            log_every=3,
+            callback=_callback,
+            callback_requires_loss=False,
+        )
+
+        finite_steps = [step for step, loss in observed if math.isfinite(loss)]
+        assert finite_steps == [0, 3, 4]
+
+    def test_callback_defaults_to_per_step_loss_values(self):
+        observed: list[tuple[int, float]] = []
+
+        def _callback(step: int, loss: float, _scene):
+            observed.append((step, loss))
+            return None
+
+        target = torch.rand(3, 16, 16)
+        _ = opt_mod.fit_image(
+            target,
+            n_open=1,
+            n_closed=0,
+            steps=5,
+            log_every=3,
+            callback=_callback,
+        )
+
+        finite_steps = [step for step, loss in observed if math.isfinite(loss)]
+        assert finite_steps == [0, 1, 2, 3, 4]

@@ -12,13 +12,11 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from jaxtyping import Float
 from torch import Tensor
 
 from .adan import Adan
-from .area import closed_curve_enclosed_area
-from .coords import model_to_pixel, pixel_to_model
+from .coords import pixel_to_model
 from .losses import LossConfig, compute_loss
 from .model import VectorGraphicsScene
 from .topology import (
@@ -40,6 +38,48 @@ def _replace_param_reference(
     """Replace ``old_param`` with ``new_param`` in all optimizer param groups."""
     for group in optimizer.param_groups:
         group["params"] = [new_param if p is old_param else p for p in group["params"]]
+
+
+def _replace_param_without_state(
+    optimizer: torch.optim.Optimizer | None,
+    old_param: nn.Parameter,
+    new_param: nn.Parameter,
+) -> None:
+    """Replace optimizer references when no state surgery is needed."""
+    if optimizer is None:
+        return
+
+    if old_param in optimizer.state:
+        del optimizer.state[old_param]
+    _replace_param_reference(optimizer, old_param, new_param)
+
+
+def _set_pruned_param(
+    scene: VectorGraphicsScene,
+    attr: str,
+    keep_mask: Tensor,
+    optimizer: torch.optim.Optimizer | None,
+) -> None:
+    """Slice one scene parameter by keep mask and rebind it."""
+    old_param = getattr(scene, attr)
+    new_param = nn.Parameter(old_param[keep_mask].clone())
+    if optimizer is not None:
+        _prune_optimizer_state(optimizer, old_param, new_param, keep_mask)
+    setattr(scene, attr, new_param)
+
+
+def _reset_param(
+    scene: VectorGraphicsScene,
+    attr: str,
+    shape: tuple[int, ...],
+    device: torch.device,
+    optimizer: torch.optim.Optimizer | None,
+) -> None:
+    """Reset one scene parameter to an empty tensor and update optimizer refs."""
+    old_param = getattr(scene, attr)
+    new_param = nn.Parameter(torch.empty(*shape, device=device))
+    _replace_param_without_state(optimizer, old_param, new_param)
+    setattr(scene, attr, new_param)
 
 
 def _prune_optimizer_state(
@@ -208,6 +248,7 @@ def fit_image(
     prune_config: PruneConfig | None = None,
     loss_config: LossConfig | None = None,
     callback: Callable[[int, float, VectorGraphicsScene], None] | None = None,
+    callback_requires_loss: bool = True,
     torch_compile: bool | str = False,
     debug: bool | str = False,
 ) -> VectorGraphicsScene:
@@ -265,6 +306,10 @@ def fit_image(
             ``loss_preset`` policy is used.
         callback: Optional callback(step, loss, scene) for monitoring.
             If the callback returns ``False``, training stops early.
+        callback_requires_loss: Whether callback needs a finite host-side
+            loss value at every step. Set ``False`` to skip per-step
+            loss sync and only pass finite values on log steps and the
+            final step.
         torch_compile: Enable ``torch.compile`` for the forward pass (CUDA
             only). ``False`` disables (default). ``True`` or ``"default"``
             uses default mode. ``"reduce-overhead"`` and ``"max-autotune"``
@@ -442,6 +487,12 @@ def fit_image(
     pending_densify = 0
 
     for step in range(steps):
+        is_log_step = step % log_every == 0
+        is_last_step = step == steps - 1
+        is_debug_ckpt_step = bool(debug) and (step % 500 == 0 or is_last_step)
+        is_debug_scalar_step = bool(debug) and (is_log_step or is_debug_ckpt_step or is_last_step)
+        is_debug_snapshot_step = bool(debug) and (step % 100 == 0 or is_last_step)
+
         # StepLR-style decay
         if step > 0 and step % lr_step_size == 0:
             lr_decay *= lr_gamma
@@ -459,7 +510,7 @@ def fit_image(
 
         forward_fn = compiled_forward if compiled_forward is not None else scene
         rendered = forward_fn(H, W)
-        collect_loss_dict = debug or step % log_every == 0
+        collect_loss_dict = is_log_step or is_debug_scalar_step
         loss, loss_dict = compute_loss(
             rendered,
             target,
@@ -470,23 +521,30 @@ def fit_image(
         )
         loss.backward()
 
-        if debug:
+        grad_stats: dict | None = None
+        if debug and (is_debug_scalar_step or is_debug_snapshot_step):
             grad_stats = collect_gradient_stats(scene)
 
         optimizer.step()
 
         # Defer loss.item() GPU-CPU sync to when we actually need the value
-        need_loss_val = debug or callback is not None or step % log_every == 0
-        loss_val = loss.item() if need_loss_val else 0.0
+        need_loss_val = (
+            is_log_step
+            or is_debug_scalar_step
+            or is_last_step
+            or (callback is not None and callback_requires_loss)
+        )
+        loss_val = loss.item() if need_loss_val else float("nan")
 
-        if debug:
+        psnr_val = float("nan")
+        if debug and is_debug_scalar_step:
             psnr_val = compute_psnr(rendered.detach(), target).item()
             log_dict = {
                 "loss": loss_val,
                 "psnr": psnr_val,
                 "n_open": scene.n_open,
                 "n_closed": scene.n_closed,
-                "mean_grad_norm": grad_stats["summary"]["mean_grad_norm"],
+                "mean_grad_norm": grad_stats["summary"]["mean_grad_norm"] if grad_stats is not None else 0.0,
             }
             # Include all individual loss terms from loss_dict
             for k, v in loss_dict.items():
@@ -499,18 +557,18 @@ def fit_image(
                 for w in warnings:
                     print(f"  [DEBUG WARNING] {w}")
 
-            if step % 100 == 0:
+            if is_debug_snapshot_step and grad_stats is not None:
                 curve_stats = collect_curve_stats(scene, H, W)
                 tracker.log_snapshot(step, "curve_stats", curve_stats)
                 tracker.log_snapshot(step, "grad_stats", grad_stats)
 
-            if step % 500 == 0 or step == steps - 1:
+            if is_debug_ckpt_step:
                 save_checkpoint(scene, step, {"loss": loss_val, "psnr": psnr_val}, Path(output_dir))
 
-        if step % log_every == 0:
+        if is_log_step:
             recon_val = loss_dict.get("reconstruction", loss_val)
             psnr_str = ""
-            if debug:
+            if debug and is_debug_scalar_step:
                 psnr_str = f" | PSNR={psnr_val:.1f}dB"
             terms = " ".join(
                 f"{k}={v:.4f}"
@@ -524,7 +582,10 @@ def fit_image(
             )
 
         if callback is not None:
-            if callback(step, loss_val, scene) is False:
+            callback_loss = loss_val
+            if not callback_requires_loss and not (is_log_step or is_last_step):
+                callback_loss = float("nan")
+            if callback(step, callback_loss, scene) is False:
                 break
 
         # Topology updates (prune / densify)
@@ -759,12 +820,8 @@ def _prune_and_densify(
             if pruned_open > 0:
                 if open_keep_mask.any():
                     for attr in ("open_control_points", "open_colors", "open_opacities", "open_stroke_widths"):
-                        old_param = getattr(scene, attr)
-                        new_param = nn.Parameter(old_param[open_keep_mask].clone())
-                        if optimizer is not None:
-                            _prune_optimizer_state(optimizer, old_param, new_param, open_keep_mask)
-                        setattr(scene, attr, new_param)
-                    scene.n_open = open_keep_mask.sum().item()
+                        _set_pruned_param(scene, attr, open_keep_mask, optimizer)
+                    scene.n_open = int(open_keep_mask.sum().item())
                 else:
                     for attr, shape in [
                         ("open_control_points", (0, 10, 2)),
@@ -772,16 +829,7 @@ def _prune_and_densify(
                         ("open_opacities", (0, 3)),
                         ("open_stroke_widths", (0,)),
                     ]:
-                        old_param = getattr(scene, attr)
-                        new_param = nn.Parameter(torch.empty(*shape, device=device))
-                        if optimizer is not None:
-                            if old_param in optimizer.state:
-                                del optimizer.state[old_param]
-                            for group in optimizer.param_groups:
-                                for i, p in enumerate(group["params"]):
-                                    if p is old_param:
-                                        group["params"][i] = new_param
-                        setattr(scene, attr, new_param)
+                        _reset_param(scene, attr, shape, device, optimizer)
                     scene.n_open = 0
 
         # ── Prune closed curves ──
@@ -792,12 +840,8 @@ def _prune_and_densify(
             if pruned_closed > 0:
                 if closed_keep_mask.any():
                     for attr in ("closed_shared_pts", "closed_interior_cp", "closed_colors", "closed_opacities"):
-                        old_param = getattr(scene, attr)
-                        new_param = nn.Parameter(old_param[closed_keep_mask].clone())
-                        if optimizer is not None:
-                            _prune_optimizer_state(optimizer, old_param, new_param, closed_keep_mask)
-                        setattr(scene, attr, new_param)
-                    scene.n_closed = closed_keep_mask.sum().item()
+                        _set_pruned_param(scene, attr, closed_keep_mask, optimizer)
+                    scene.n_closed = int(closed_keep_mask.sum().item())
                 else:
                     num_interior = scene.closed_interior_cp.shape[2]
                     for attr, shape in [
@@ -806,16 +850,7 @@ def _prune_and_densify(
                         ("closed_colors", (0, 3)),
                         ("closed_opacities", (0, 3)),
                     ]:
-                        old_param = getattr(scene, attr)
-                        new_param = nn.Parameter(torch.empty(*shape, device=device))
-                        if optimizer is not None:
-                            if old_param in optimizer.state:
-                                del optimizer.state[old_param]
-                            for group in optimizer.param_groups:
-                                for i, p in enumerate(group["params"]):
-                                    if p is old_param:
-                                        group["params"][i] = new_param
-                        setattr(scene, attr, new_param)
+                        _reset_param(scene, attr, shape, device, optimizer)
                     scene.n_closed = 0
 
         # ── Rebuild _depth to match surviving curves ──
@@ -838,24 +873,12 @@ def _prune_and_densify(
                 else:
                     old_depth = scene._depth
                     new_depth = nn.Parameter(torch.empty(0, 1, device=device))
-                    if optimizer is not None:
-                        if old_depth in optimizer.state:
-                            del optimizer.state[old_depth]
-                        for group in optimizer.param_groups:
-                            for i, p in enumerate(group["params"]):
-                                if p is old_depth:
-                                    group["params"][i] = new_depth
+                    _replace_param_without_state(optimizer, old_depth, new_depth)
                     scene._depth = new_depth
             else:
                 old_depth = scene._depth
                 new_depth = nn.Parameter(torch.empty(0, 1, device=device))
-                if optimizer is not None:
-                    if old_depth in optimizer.state:
-                        del optimizer.state[old_depth]
-                    for group in optimizer.param_groups:
-                        for i, p in enumerate(group["params"]):
-                            if p is old_depth:
-                                group["params"][i] = new_depth
+                _replace_param_without_state(optimizer, old_depth, new_depth)
                 scene._depth = new_depth
 
     total_pruned = pruned_open + pruned_closed

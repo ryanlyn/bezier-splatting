@@ -167,6 +167,15 @@ def compute_color_distance(colors: Float[Tensor, "N 3"]) -> Float[Tensor, "N N"]
     return torch.sqrt((diff ** 2).sum(dim=-1) + 1e-12)  # (N, N)
 
 
+def _staged_threshold(progress: float, early: float, mid: float, late: float) -> float:
+    """Select early/mid/late threshold based on training progress."""
+    if progress < 0.6:
+        return early
+    if progress < 0.8:
+        return mid
+    return late
+
+
 # ── Composite masks ──────────────────────────────────────────────────────
 
 
@@ -314,12 +323,12 @@ def compute_prune_mask_open(
 
     # 5. Overlap + color similarity suppression
     # Select area threshold based on progress
-    if progress < 0.6:
-        overlap_area_thresh = config.area_threshold_early
-    elif progress < 0.8:
-        overlap_area_thresh = config.area_threshold_mid
-    else:
-        overlap_area_thresh = config.area_threshold_late
+    overlap_area_thresh = _staged_threshold(
+        progress,
+        config.area_threshold_early,
+        config.area_threshold_mid,
+        config.area_threshold_late,
+    )
 
     open_overlap_colors = scene.open_colors.clamp(0.0, 1.0) * open_opacities
     keep_overlap = compute_overlap_suppression_mask(
@@ -420,12 +429,12 @@ def compute_prune_mask_closed(
     areas = closed_curve_enclosed_area(bcp_px)  # (N,)
 
     # Staged area threshold
-    if progress < 0.6:
-        area_thresh = config.area_threshold_early
-    elif progress < 0.8:
-        area_thresh = config.area_threshold_mid
-    else:
-        area_thresh = config.area_threshold_late
+    area_thresh = _staged_threshold(
+        progress,
+        config.area_threshold_early,
+        config.area_threshold_mid,
+        config.area_threshold_late,
+    )
 
     # 4. Tiny curve suppression
     keep_tiny = compute_tiny_curve_mask(

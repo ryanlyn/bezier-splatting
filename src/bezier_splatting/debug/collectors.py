@@ -151,7 +151,7 @@ def collect_curve_stats(scene: VectorGraphicsScene, H: int, W: int) -> dict:
 
 
 def snapshot_scene(scene: VectorGraphicsScene) -> dict:
-    """Deep-copy all parameter tensors (detached, CPU). For before/after comparison."""
+    """Deep-copy parameters/buffers plus render metadata for scene reconstruction."""
     snap: dict = {}
     for name, param in scene.named_parameters():
         snap[name] = param.detach().cpu().clone()
@@ -159,4 +159,11 @@ def snapshot_scene(scene: VectorGraphicsScene) -> dict:
         snap[name] = buf.detach().cpu().clone()
     snap["n_open"] = scene.n_open
     snap["n_closed"] = scene.n_closed
+    snap["samples_per_open"] = scene.open_sampler.samples_per_curve
+    snap["samples_per_closed_curve"] = scene.closed_sampler.samples_per_curve
+    snap["num_intermediate"] = scene.closed_sampler.num_intermediate
+    snap["closed_sampling_mode"] = scene.closed_sampling_mode
+    snap["raster_backend"] = scene.raster_backend
+    snap["raster_tile_size"] = scene.raster_tile_size
+    snap["raster_chunk_size"] = scene.raster_chunk_size
     return snap

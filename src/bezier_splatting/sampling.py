@@ -39,6 +39,45 @@ class GaussianParams:
         )
 
 
+def _empty_gaussian_params(device: torch.device) -> GaussianParams:
+    """Return an empty GaussianParams container on ``device``."""
+    return GaussianParams(
+        means=torch.empty(0, 2, device=device),
+        scales=torch.empty(0, 2, device=device),
+        rotations=torch.empty(0, device=device),
+        colors=torch.empty(0, 3, device=device),
+        opacities=torch.empty(0, device=device),
+        curve_ids=torch.empty(0, dtype=torch.long, device=device),
+    )
+
+
+def _safe_pairwise_spacing(points: Tensor, sample_dim: int) -> Tensor:
+    """Compute pairwise Euclidean spacing with terminal replication."""
+    diffs = torch.diff(points, dim=sample_dim)
+    spacing = torch.sqrt((diffs ** 2).sum(dim=-1) + 1e-12)
+
+    tail_idx = [slice(None)] * spacing.ndim
+    tail_idx[sample_dim] = slice(-1, None)
+    tail = spacing[tuple(tail_idx)]
+    return torch.cat([spacing, tail], dim=sample_dim)
+
+
+def _closed_spacing_permutation(rows_total: int, device: torch.device) -> Tensor:
+    """Permutation from output row order to spacing row order.
+
+    Output order is ``[top, bottom, interiors...]`` while spacing expects
+    ``[top, interiors..., bottom]``.
+    """
+    if rows_total <= 2:
+        return torch.arange(rows_total, device=device, dtype=torch.long)
+
+    perm = torch.empty(rows_total, device=device, dtype=torch.long)
+    perm[0] = 0
+    perm[1:-1] = torch.arange(2, rows_total, device=device, dtype=torch.long)
+    perm[-1] = 1
+    return perm
+
+
 def _central_diff_angles(points: Float[Tensor, "*batch K 2"]) -> Float[Tensor, "*batch K"]:
     """Rotation angles via central differences of sampled points (paper Eq. 8).
 
@@ -50,7 +89,7 @@ def _central_diff_angles(points: Float[Tensor, "*batch K 2"]) -> Float[Tensor, "
     """
     # Replicate-pad K dim by 1 on each side so central diffs naturally
     # become forward diff at k=0 and backward diff at k=K-1.
-    padded = F.pad(points, (0, 0, 1, 1), mode='replicate')  # (..., K+2, 2)
+    padded = F.pad(points, (0, 0, 1, 1), mode="replicate")  # (..., K+2, 2)
     diffs = padded[..., 2:, :] - padded[..., :-2, :]        # (..., K, 2)
     return torch.atan2(diffs[..., 1], diffs[..., 0])
 
@@ -165,14 +204,7 @@ class OpenCurveSampler:
         device = control_points.device
 
         if N == 0:
-            return GaussianParams(
-                means=torch.empty(0, 2, device=device),
-                scales=torch.empty(0, 2, device=device),
-                rotations=torch.empty(0, device=device),
-                colors=torch.empty(0, 3, device=device),
-                opacities=torch.empty(0, device=device),
-                curve_ids=torch.empty(0, dtype=torch.long, device=device),
-            )
+            return _empty_gaussian_params(device)
 
         # Scale control points to pixel coordinates
         cp_px = model_to_pixel(control_points, H, W)
@@ -185,9 +217,7 @@ class OpenCurveSampler:
         angles = _central_diff_angles(points)  # (N, K)
 
         # σ_x: distance to next sample / rho + offset to prevent zero
-        diffs = torch.diff(points, dim=1)  # (N, K-1, 2)
-        spacings = torch.sqrt((diffs ** 2).sum(dim=-1) + 1e-12)  # (N, K-1)
-        spacings = torch.cat([spacings, spacings[:, -1:]], dim=1)  # (N, K)
+        spacings = _safe_pairwise_spacing(points, sample_dim=1)  # (N, K)
         sigma_x = spacings / self.rho + 0.5  # (N, K) — offset guarantees positivity
 
         # σ_y: stroke width — sigmoid maps to [0.5, 5] pixel range
@@ -265,14 +295,7 @@ class ClosedCurveSampler:
         device = boundary_cp.device
 
         if N == 0:
-            return GaussianParams(
-                means=torch.empty(0, 2, device=device),
-                scales=torch.empty(0, 2, device=device),
-                rotations=torch.empty(0, device=device),
-                colors=torch.empty(0, 3, device=device),
-                opacities=torch.empty(0, device=device),
-                curve_ids=torch.empty(0, dtype=torch.long, device=device),
-            )
+            return _empty_gaussian_params(device)
 
         # Scale CPs to pixel coordinates
         bcp_px = model_to_pixel(boundary_cp, H, W)  # (N, 2, num_cp, 2)
@@ -316,22 +339,13 @@ class ClosedCurveSampler:
         angles = _central_diff_angles(points)  # (N, R_total, K)
 
         # σ_x: along-curve spacing
-        diffs_along = torch.diff(points, dim=2)  # (N, R_total, K-1, 2)
-        spacings_along = torch.sqrt((diffs_along ** 2).sum(dim=-1) + 1e-12)
-        spacings_along = torch.cat([spacings_along, spacings_along[..., -1:]], dim=2)
+        spacings_along = _safe_pairwise_spacing(points, sample_dim=2)
         sigma_x = spacings_along / self.rho  # (N, R_total, K)
 
         # σ_y: cross-curve spacing (distance between adjacent rows at same k).
         # Use order [top, interiors..., bottom] for spacing computation, then
         # map back to output row order [top, bottom, interiors...].
-        if R_total > 2:
-            perm = torch.empty(R_total, device=device, dtype=torch.long)
-            perm[0] = 0
-            if R_total > 3:
-                perm[1:-1] = torch.arange(2, R_total, device=device, dtype=torch.long)
-            perm[-1] = 1
-        else:
-            perm = torch.arange(R_total, device=device, dtype=torch.long)
+        perm = _closed_spacing_permutation(R_total, device)
         inv_perm = torch.argsort(perm)
 
         points_reordered = points[:, perm]  # (N, R_total, K, 2)

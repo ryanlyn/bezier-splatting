@@ -4,14 +4,11 @@ All control points are stored in [-1, 1] normalized coordinates.
 Scaling to pixel coordinates happens at sampling/rendering time.
 """
 
-import math
-
 import torch
 import torch.nn as nn
 from jaxtyping import Float
 from torch import Tensor
 
-from .area import closed_curve_enclosed_area
 from .coords import model_to_pixel
 from .rasterizer import RasterBackend, rasterize
 from .sampling import ClosedCurveSampler, GaussianParams, OpenCurveSampler
@@ -140,6 +137,7 @@ class VectorGraphicsScene(nn.Module):
         if self.n_closed == 0:
             num_cp = self.closed_interior_cp.shape[2] + 2
             return torch.empty(0, 2, num_cp, 2, device=self.closed_interior_cp.device)
+
         # Broadcast shared points to both boundaries: (N, 2) -> (N, 2, 1, 2)
         start = self.closed_shared_pts[:, 0, :].unsqueeze(1).unsqueeze(1).expand(-1, 2, 1, -1)
         end = self.closed_shared_pts[:, 1, :].unsqueeze(1).unsqueeze(1).expand(-1, 2, 1, -1)
@@ -248,16 +246,13 @@ class VectorGraphicsScene(nn.Module):
                 R_total = self.closed_sampler.num_intermediate + 2
                 closed_samples_per_curve = R_total * self.closed_sampler.samples_per_curve
 
-        if len(all_gaussians) == 0:
+        if not all_gaussians:
             return None
 
         # Concatenate all Gaussians
-        if len(all_gaussians) == 1:
-            combined = all_gaussians[0]
-        else:
-            combined = all_gaussians[0]
-            for g in all_gaussians[1:]:
-                combined = combined.concat(g)
+        combined = all_gaussians[0]
+        for g in all_gaussians[1:]:
+            combined = combined.concat(g)
 
         # ── Depth-based sorting ──
         # Open depth is always detached; closed depth passes through sigmoid

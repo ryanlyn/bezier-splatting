@@ -22,7 +22,7 @@ from torch import Tensor
 
 from ..coords import model_to_pixel
 from ..model import VectorGraphicsScene
-from ..rasterizer import rasterize
+from ..rasterizer import _check_gsplat, rasterize
 from ..sampling import GaussianParams
 
 
@@ -57,13 +57,39 @@ def _scene_from_state(
     n_open: int | None = None,
     n_closed: int | None = None,
     num_cp_closed_hint: int = 4,
+    samples_per_open: int = 20,
+    samples_per_closed_curve: int = 15,
+    num_intermediate: int = 20,
+    closed_sampling_mode: str = "cdf",
+    raster_backend: str = "auto",
+    raster_tile_size: int = 16,
+    raster_chunk_size: int = 16,
 ) -> VectorGraphicsScene:
     """Reconstruct a scene from serialized state tensors."""
     state = dict(raw_state)
     n_open, n_closed = _infer_curve_counts(state, n_open, n_closed)
     num_cp_closed = _infer_closed_cp(state, fallback=num_cp_closed_hint)
 
-    scene = VectorGraphicsScene(n_open=n_open, n_closed=n_closed, closed_cp=num_cp_closed)
+    # Avoid hard failures when checkpoints were created with gsplat on a
+    # machine that does not currently support gsplat.
+    resolved_backend = raster_backend
+    if raster_backend in {"gsplat", "cuda_gsplat"} and (
+        not torch.cuda.is_available() or not _check_gsplat()
+    ):
+        resolved_backend = "auto"
+
+    scene = VectorGraphicsScene(
+        n_open=n_open,
+        n_closed=n_closed,
+        closed_cp=num_cp_closed,
+        samples_per_open=samples_per_open,
+        samples_per_closed_curve=samples_per_closed_curve,
+        num_intermediate=num_intermediate,
+        closed_sampling_mode=closed_sampling_mode,
+        raster_backend=resolved_backend,
+        raster_tile_size=raster_tile_size,
+        raster_chunk_size=raster_chunk_size,
+    )
     scene.load_state_dict(state, strict=False)
     return scene
 
@@ -152,7 +178,18 @@ def _scene_from_snapshot(snapshot: dict) -> VectorGraphicsScene:
     n_open = snapshot.get("n_open")
     n_closed = snapshot.get("n_closed")
     state = {key: val for key, val in snapshot.items() if isinstance(val, Tensor)}
-    return _scene_from_state(state, n_open=n_open, n_closed=n_closed)
+    return _scene_from_state(
+        state,
+        n_open=n_open,
+        n_closed=n_closed,
+        samples_per_open=int(snapshot.get("samples_per_open", 20)),
+        samples_per_closed_curve=int(snapshot.get("samples_per_closed_curve", 15)),
+        num_intermediate=int(snapshot.get("num_intermediate", 20)),
+        closed_sampling_mode=str(snapshot.get("closed_sampling_mode", "cdf")),
+        raster_backend=str(snapshot.get("raster_backend", "auto")),
+        raster_tile_size=int(snapshot.get("raster_tile_size", 16)),
+        raster_chunk_size=int(snapshot.get("raster_chunk_size", 16)),
+    )
 
 
 def _scene_from_checkpoint(ckpt: dict) -> VectorGraphicsScene:
@@ -166,6 +203,13 @@ def _scene_from_checkpoint(ckpt: dict) -> VectorGraphicsScene:
         n_open=n_open,
         n_closed=n_closed,
         num_cp_closed_hint=num_cp_closed,
+        samples_per_open=int(ckpt.get("samples_per_open", 20)),
+        samples_per_closed_curve=int(ckpt.get("samples_per_closed_curve", 15)),
+        num_intermediate=int(ckpt.get("num_intermediate", 20)),
+        closed_sampling_mode=str(ckpt.get("closed_sampling_mode", "cdf")),
+        raster_backend=str(ckpt.get("raster_backend", "auto")),
+        raster_tile_size=int(ckpt.get("raster_tile_size", 16)),
+        raster_chunk_size=int(ckpt.get("raster_chunk_size", 16)),
     )
 
 
@@ -405,7 +449,14 @@ def render_layer_decomposition(
             curve_ids=gaussians.curve_ids,
         )
         with torch.no_grad():
-            rendered = rasterize(masked_g, H, W)
+            rendered = rasterize(
+                masked_g,
+                H,
+                W,
+                backend=scene.raster_backend,
+                tile_size=scene.raster_tile_size,
+                chunk_size=scene.raster_chunk_size,
+            )
 
         img = _tensor_to_numpy_image(rendered)
         ax.imshow(img, extent=[0, W, H, 0])

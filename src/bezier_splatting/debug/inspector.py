@@ -845,6 +845,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
                     log_every=max(1, steps // 40),
                     lr_scale=lr_scale,
                     callback=callback,
+                    callback_requires_loss=False,
                     debug=str(output_dir),
                 )
             except Exception as e:
