@@ -125,6 +125,71 @@ class FrameRecorder:
     def frame_count(self) -> int:
         return len(self._frames)
 
+    def save(self, path: Path) -> Path:
+        """Persist captured frames to a ``.pt`` file for deferred GIF export.
+
+        The file contains all frame data (rendered tensors, SVG overlays,
+        metrics) plus the target image and resolution — everything needed
+        to reconstruct the GIF later via ``FrameRecorder.load()``.
+
+        Returns the path written.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        serialised_frames = []
+        for f in self._frames:
+            serialised_frames.append({
+                "step": f.step,
+                "rendered": f.rendered,
+                "loss": f.loss,
+                "psnr": f.psnr,
+                "n_open": f.n_open,
+                "n_closed": f.n_closed,
+                "event": f.event,
+                "svg_overlay": torch.from_numpy(f.svg_overlay) if f.svg_overlay is not None else None,
+            })
+
+        torch.save({
+            "target_np": torch.from_numpy(self._target_np),
+            "H": self._H,
+            "W": self._W,
+            "frames": serialised_frames,
+        }, path)
+        return path
+
+    @classmethod
+    def load(cls, path: Path, config: AnimationConfig | None = None) -> "FrameRecorder":
+        """Load a previously saved ``FrameRecorder`` from a ``.pt`` file.
+
+        The returned recorder is ready for ``export()`` — call with any
+        ``AnimationConfig`` to re-compose the GIF with different layout/fps.
+        """
+        data = torch.load(path, map_location="cpu", weights_only=False)
+        config = config or AnimationConfig()
+        rec = cls.__new__(cls)
+        rec._config = config
+        rec._target_np = data["target_np"].numpy()
+        rec._H = data["H"]
+        rec._W = data["W"]
+        rec._lock = threading.Lock()
+        rec._pending_event = None
+
+        rec._frames = []
+        for fd in data["frames"]:
+            svg = fd["svg_overlay"].numpy() if fd["svg_overlay"] is not None else None
+            rec._frames.append(FrameData(
+                step=fd["step"],
+                rendered=fd["rendered"],
+                loss=fd["loss"],
+                psnr=fd["psnr"],
+                n_open=fd["n_open"],
+                n_closed=fd["n_closed"],
+                event=fd["event"],
+                svg_overlay=svg,
+            ))
+        return rec
+
     def export(self, output_path: Path) -> Path:
         """Compose all frames and write an animated GIF + sidecar JSON.
 

@@ -342,3 +342,68 @@ class TestGIFExport:
             rec.export(gif_path)
             assert gif_path.exists()
             assert gif_path.stat().st_size > 0
+
+
+# ---------------------------------------------------------------------------
+# Save / load round-trip tests
+# ---------------------------------------------------------------------------
+
+
+class TestSaveLoad:
+    def test_round_trip_preserves_frames(self, populated_recorder, tmp_path):
+        save_path = tmp_path / "frames.pt"
+        populated_recorder.save(save_path)
+        assert save_path.exists()
+
+        loaded = FrameRecorder.load(save_path)
+        assert loaded.frame_count == populated_recorder.frame_count
+
+        for orig, loaded_f in zip(populated_recorder._frames, loaded._frames):
+            assert orig.step == loaded_f.step
+            assert orig.loss == loaded_f.loss
+            assert orig.psnr == loaded_f.psnr
+            assert orig.n_open == loaded_f.n_open
+            assert orig.n_closed == loaded_f.n_closed
+            assert orig.event == loaded_f.event
+            assert torch.allclose(orig.rendered, loaded_f.rendered)
+
+    def test_round_trip_preserves_target(self, populated_recorder, tmp_path):
+        save_path = tmp_path / "frames.pt"
+        populated_recorder.save(save_path)
+        loaded = FrameRecorder.load(save_path)
+        assert (loaded._target_np == populated_recorder._target_np).all()
+        assert loaded._H == populated_recorder._H
+        assert loaded._W == populated_recorder._W
+
+    def test_round_trip_with_svg_overlay(self, target_tensor, tmp_path):
+        config = AnimationConfig(target_frames=5, fps=5)
+        rec = FrameRecorder(config, target_tensor, 16, 16)
+        svg = (torch.rand(16, 16, 3) * 255).byte().numpy()
+        rec.maybe_capture(0, 9, torch.rand(3, 16, 16),
+                          loss=0.5, psnr=20.0, n_open=2, n_closed=1,
+                          svg_overlay=svg)
+        save_path = tmp_path / "frames.pt"
+        rec.save(save_path)
+        loaded = FrameRecorder.load(save_path)
+        assert loaded._frames[0].svg_overlay is not None
+        assert (loaded._frames[0].svg_overlay == svg).all()
+
+    def test_loaded_recorder_can_export(self, populated_recorder, tmp_path):
+        save_path = tmp_path / "frames.pt"
+        populated_recorder.save(save_path)
+
+        loaded = FrameRecorder.load(save_path, AnimationConfig(layout="standard", fps=5))
+        gif_path = tmp_path / "loaded.gif"
+        result = loaded.export(gif_path)
+        assert result.exists()
+        assert gif_path.stat().st_size > 0
+
+    def test_load_with_custom_config(self, populated_recorder, tmp_path):
+        save_path = tmp_path / "frames.pt"
+        populated_recorder.save(save_path)
+
+        config = AnimationConfig(layout="full", fps=20, target_frames=3)
+        loaded = FrameRecorder.load(save_path, config)
+        assert loaded._config.layout == "full"
+        assert loaded._config.fps == 20
+        assert loaded._config.target_frames == 3
