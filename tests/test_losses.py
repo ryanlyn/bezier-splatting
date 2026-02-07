@@ -215,11 +215,12 @@ class TestXingLoss:
     """Tests for xing_loss (moved from optimization.py)."""
 
     def test_open_curves_only(self):
-        """Xing loss should work with open curves only."""
+        """Xing loss should be zero for open-only scenes."""
         scene = VectorGraphicsScene(n_open=4, n_closed=0, H=32, W=32)
         loss = xing_loss(scene)
         assert loss.shape == ()
         assert torch.isfinite(loss)
+        assert loss.item() == 0.0
 
     def test_closed_curves_only(self):
         """Xing loss should work with closed curves only."""
@@ -229,7 +230,7 @@ class TestXingLoss:
         assert torch.isfinite(loss)
 
     def test_both_curve_types(self):
-        """Xing loss should work with both curve types."""
+        """Xing loss should work with mixed scenes (closed-only contribution)."""
         scene = VectorGraphicsScene(n_open=3, n_closed=3, H=32, W=32)
         loss = xing_loss(scene)
         assert loss.shape == ()
@@ -242,11 +243,11 @@ class TestXingLoss:
         assert loss.item() >= 0
 
     def test_differentiable(self):
-        """Xing loss should flow gradients back to control points."""
-        scene = VectorGraphicsScene(n_open=4, n_closed=0, H=32, W=32)
+        """Xing loss should flow gradients back to closed control points."""
+        scene = VectorGraphicsScene(n_open=0, n_closed=4, H=32, W=32)
         loss = xing_loss(scene)
         loss.backward()
-        assert scene.open_control_points.grad is not None
+        assert scene.closed_shared_pts.grad is not None
 
 
 class TestComputeLoss:
@@ -298,7 +299,7 @@ class TestComputeLoss:
         )
         total, loss_dict = compute_loss(rendered, target, scene, config)
         assert "reconstruction" in loss_dict
-        assert "xing" in loss_dict
+        assert "xing" not in loss_dict
         assert "boundary_joint" in loss_dict  # applies to open curves
         # Closed-only terms should not appear (no closed curves)
         assert "shape_reg" not in loss_dict
@@ -323,7 +324,7 @@ class TestComputeLoss:
         assert expected_keys == set(loss_dict.keys())
 
     def test_xing_only(self):
-        """Enable only xing loss alongside reconstruction."""
+        """Open-only scenes should ignore xing and keep reconstruction-only loss."""
         scene = VectorGraphicsScene(n_open=4, n_closed=0, H=32, W=32)
         rendered = scene(32, 32).detach()
         target = torch.rand(3, 32, 32)
@@ -335,7 +336,8 @@ class TestComputeLoss:
             apply_boundary=False,
         )
         total, loss_dict = compute_loss(rendered, target, scene, config)
-        assert "xing" in loss_dict
+        assert "xing" not in loss_dict
+        assert set(loss_dict.keys()) == {"reconstruction", "total"}
         assert "shape_reg" not in loss_dict
 
     def test_loss_dict_values_are_float(self):
