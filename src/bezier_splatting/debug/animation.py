@@ -30,6 +30,8 @@ class AnimationConfig:
         last_frame_hold: Hold the final frame this many seconds longer.
         panel_size: Resize panels to this dimension. None uses the training
             resolution. Minimum 128.
+        max_size_mb: Maximum GIF size in megabytes. Export adaptively reduces
+            color palette, frame count, and panel size to stay under this cap.
     """
 
     layout: str = "standard"
@@ -37,6 +39,7 @@ class AnimationConfig:
     fps: int = 10
     last_frame_hold: float = 3.0
     panel_size: int | None = None
+    max_size_mb: float = 8.0
 
 
 @dataclass
@@ -210,62 +213,75 @@ class FrameRecorder:
             panel_size = max(256, self._H, self._W)
         panel_size = max(panel_size, 128)
 
-        pil_frames: list[Image.Image] = []
-        json_frames: list[dict] = []
-
-        # Build per-frame loss/psnr histories from captured frame data
-        all_losses = [f.loss for f in frames]
-        all_psnrs = [f.psnr for f in frames]
-
-        for i, frame in enumerate(frames):
-            rendered_np = _tensor_to_uint8(frame.rendered)
-            losses_so_far = all_losses[: i + 1]
-            psnrs_so_far = all_psnrs[: i + 1]
-
-            composed = _compose_frame(
-                layout=self._config.layout,
-                target_np=self._target_np,
-                rendered_np=rendered_np,
-                frame=frame,
-                total_steps=frames[-1].step,
-                losses=losses_so_far,
-                psnrs=psnrs_so_far,
-                panel_size=panel_size,
-            )
-            pil_frames.append(composed)
-            json_frames.append(
-                {
-                    "step": frame.step,
-                    "loss": frame.loss,
-                    "psnr": frame.psnr,
-                    "n_open": frame.n_open,
-                    "n_closed": frame.n_closed,
-                    "event": frame.event,
-                }
-            )
-
-        # Build per-frame durations (milliseconds)
-        base_duration = 1000 // self._config.fps
-        durations = [base_duration] * len(pil_frames)
-        # Hold last frame longer
-        durations[-1] = int(base_duration * self._config.last_frame_hold / (1.0 / self._config.fps))
-
+        max_bytes = int(self._config.max_size_mb * 1024 * 1024)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        pil_frames[0].save(
-            output_path,
-            save_all=True,
-            append_images=pil_frames[1:],
-            duration=durations,
-            loop=0,
-        )
+
+        selected_frames = list(frames)
+        selected_panel_size = panel_size
+        selected_colors = 256
+
+        for frame_ratio, panel_ratio, colors in _compression_plan():
+            target_count = max(1, int(round(len(frames) * frame_ratio)))
+            candidate_frames = _downsample_frames(frames, target_count)
+
+            if panel_size is None:
+                candidate_panel_size = None
+            else:
+                candidate_panel_size = max(64, int(round(panel_size * panel_ratio)))
+
+            candidate_images, candidate_json = _compose_export_frames(
+                candidate_frames,
+                self._target_np,
+                self._config.layout,
+                candidate_panel_size,
+            )
+            candidate_durations = _build_durations(
+                len(candidate_images),
+                self._config.fps,
+                self._config.last_frame_hold,
+            )
+            encoded = [_quantize_gif_frame(img, colors) for img in candidate_images]
+            _save_gif(output_path, encoded, candidate_durations)
+
+            if output_path.stat().st_size <= max_bytes:
+                selected_frames = candidate_frames
+                selected_panel_size = candidate_panel_size if candidate_panel_size is not None else panel_size
+                selected_colors = colors
+                json_frames = candidate_json
+                break
+        else:
+            # Hard fallback: keep only the final frame at tiny size.
+            fallback_frames = [frames[-1]]
+            fallback_panel = 32 if panel_size is None else max(32, panel_size // 8)
+            fallback_images, fallback_json = _compose_export_frames(
+                fallback_frames,
+                self._target_np,
+                self._config.layout,
+                fallback_panel,
+            )
+            fallback_durations = _build_durations(
+                len(fallback_images),
+                self._config.fps,
+                self._config.last_frame_hold,
+            )
+            encoded = [_quantize_gif_frame(img, 16) for img in fallback_images]
+            _save_gif(output_path, encoded, fallback_durations)
+            selected_frames = fallback_frames
+            selected_panel_size = fallback_panel
+            selected_colors = 16
+            json_frames = fallback_json
 
         # Sidecar JSON
         sidecar = {
             "target": None,
             "resolution": [self._H, self._W],
-            "total_steps": frames[-1].step if frames else 0,
+            "total_steps": selected_frames[-1].step if selected_frames else 0,
             "fps": self._config.fps,
             "layout": self._config.layout,
+            "max_size_mb": self._config.max_size_mb,
+            "final_size_bytes": output_path.stat().st_size,
+            "palette_colors": selected_colors,
+            "panel_size": selected_panel_size,
             "frames": json_frames,
         }
         json_path = output_path.with_suffix(".json")
@@ -285,6 +301,100 @@ def _tensor_to_uint8(tensor: Tensor) -> np.ndarray:
     if t.ndim == 3 and t.shape[0] in (1, 3):
         t = t.permute(1, 2, 0)
     return (t.clamp(0, 1) * 255).byte().numpy()
+
+
+def _compression_plan() -> list[tuple[float, float, int]]:
+    """Progressive (frame ratio, panel ratio, palette colors) compression plan."""
+    return [
+        (1.00, 1.00, 256),
+        (1.00, 1.00, 192),
+        (1.00, 1.00, 128),
+        (0.85, 1.00, 128),
+        (0.70, 1.00, 96),
+        (0.55, 0.90, 96),
+        (0.45, 0.80, 64),
+        (0.35, 0.70, 64),
+        (0.28, 0.60, 48),
+        (0.22, 0.50, 32),
+        (0.16, 0.40, 24),
+        (0.12, 0.35, 16),
+        (0.08, 0.30, 16),
+        (0.05, 0.25, 16),
+        (0.03, 0.20, 16),
+        (0.02, 0.16, 16),
+        (0.01, 0.12, 16),
+    ]
+
+
+def _compose_export_frames(
+    frames: list[FrameData],
+    target_np: np.ndarray,
+    layout: str,
+    panel_size: int | None,
+) -> tuple[list[Image.Image], list[dict]]:
+    """Compose frame images and JSON frame metadata for export."""
+    pil_frames: list[Image.Image] = []
+    json_frames: list[dict] = []
+    all_losses = [f.loss for f in frames]
+    all_psnrs = [f.psnr for f in frames]
+    total_steps = frames[-1].step if frames else 0
+
+    for i, frame in enumerate(frames):
+        rendered_np = _tensor_to_uint8(frame.rendered)
+        composed = _compose_frame(
+            layout=layout,
+            target_np=target_np,
+            rendered_np=rendered_np,
+            frame=frame,
+            total_steps=total_steps,
+            losses=all_losses[: i + 1],
+            psnrs=all_psnrs[: i + 1],
+            panel_size=panel_size,
+        )
+        pil_frames.append(composed)
+        json_frames.append(
+            {
+                "step": frame.step,
+                "loss": frame.loss,
+                "psnr": frame.psnr,
+                "n_open": frame.n_open,
+                "n_closed": frame.n_closed,
+                "event": frame.event,
+            }
+        )
+    return pil_frames, json_frames
+
+
+def _build_durations(frame_count: int, fps: int, last_frame_hold: float) -> list[int]:
+    """Build per-frame GIF durations (ms), with an extended final frame."""
+    base_duration = max(1, 1000 // max(1, fps))
+    durations = [base_duration] * max(1, frame_count)
+    hold_ms = int(max(1, round(last_frame_hold * 1000.0)))
+    durations[-1] = hold_ms
+    return durations
+
+
+def _quantize_gif_frame(image: Image.Image, colors: int) -> Image.Image:
+    """Quantize an RGB frame to a bounded palette for GIF compression."""
+    colors = max(2, min(256, int(colors)))
+    dither_none = getattr(Image, "Dither", None)
+    dither_value = dither_none.NONE if dither_none is not None else Image.NONE
+    return image.convert("P", palette=Image.Palette.ADAPTIVE, colors=colors, dither=dither_value)
+
+
+def _save_gif(path: Path, frames: list[Image.Image], durations: list[int]) -> None:
+    """Write GIF to disk from quantized P-mode frames."""
+    if not frames:
+        raise ValueError("Cannot save empty GIF frame list")
+    frames[0].save(
+        path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=0,
+        optimize=True,
+        disposal=2,
+    )
 
 
 def _downsample_frames(frames: list[FrameData], target: int) -> list[FrameData]:

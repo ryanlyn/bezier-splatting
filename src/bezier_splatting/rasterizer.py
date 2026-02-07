@@ -9,6 +9,8 @@ Legacy backend strings ``"reference"`` and ``"mps"`` are accepted as aliases for
 Both backends are differentiable and return identical shapes.
 """
 
+import warnings
+
 import torch
 from jaxtyping import Float
 from torch import Tensor
@@ -98,8 +100,17 @@ def _resolve_backend(backend: RasterBackend, device: torch.device) -> str:
     Returns ``"pytorch"`` or ``"gsplat"``.
     """
     if backend == "auto":
-        if device.type == "cuda" and _check_gsplat():
-            return "gsplat"
+        if device.type == "cuda":
+            if _check_gsplat():
+                return "gsplat"
+            warnings.warn(
+                "Raster backend `auto` resolved to `pytorch` on CUDA because `gsplat` is unavailable. "
+                "This can be significantly slower and may use more memory. "
+                "Install `gsplat` (e.g. `uv sync --extra cuda` or `pip install gsplat`) "
+                "or set backend explicitly.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return "pytorch"
 
     if backend in {"pytorch", "mps", "reference"}:

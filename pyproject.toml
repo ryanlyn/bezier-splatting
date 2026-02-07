@@ -18,12 +18,17 @@ dependencies = [
 
 [project.scripts]
 bezier-debug = "bezier_splatting.debug.inspector:main"
+bezier-repro = "bezier_splatting.repro.cli:main"
 
 [project.optional-dependencies]
 cuda = [
     "gsplat>=1.0",
 ]
 debug = ["trackio", "gradio>=5.0.0"]
+repro = [
+    "lpips>=0.1.4",
+    "pytorch-msssim>=1.0.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.8.23,<0.9.0"]

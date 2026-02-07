@@ -15,6 +15,7 @@ Requires ``gradio>=5.0.0`` (listed in the ``debug`` optional dependency group).
 """
 
 import math
+import os
 import queue
 import re
 import tempfile
@@ -37,7 +38,7 @@ from torch import Tensor
 
 from ..coords import model_to_pixel
 from ..model import VectorGraphicsScene
-from ..rasterizer import _build_covariance, _invert_2x2, rasterize
+from ..rasterizer import _build_covariance, _check_gsplat, _invert_2x2, rasterize
 from ..sampling import GaussianParams
 from .checkpoints import list_checkpoints
 from .samples import (
@@ -60,9 +61,51 @@ from .viz import (
 )
 
 
+# Paper-aligned defaults (Sec. 4 implementation details + appendix settings)
+PAPER_DEFAULT_RESOLUTION = 1024
+PAPER_MAX_RESOLUTION = 2048
+PAPER_MAX_CURVES = 2048
+PAPER_OPEN_STEPS = 15000
+PAPER_CLOSED_STEPS = 10000
+PAPER_CP_LR = 2e-4
+PAPER_SAMPLES_PER_OPEN = 20
+PAPER_SAMPLES_PER_CLOSED_CURVE = 20
+PAPER_NUM_INTERMEDIATE = 20
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _paper_lr_scale(resolution: int) -> float:
+    """Map paper CP lr (2e-4) onto this repo's resolution-aware lr scaling."""
+    # fit_image uses cp_lr = 0.25 / max(H, W) * lr_scale
+    # => lr_scale = PAPER_CP_LR / (0.25 / resolution)
+    return PAPER_CP_LR * max(1, resolution) / 0.25
+
+
+def _cuda_training_selected() -> bool:
+    """Mirror fit_image device resolution for the debug preflight."""
+    env_device = os.getenv("BEZIER_TRAIN_DEVICE")
+    if env_device is None or env_device == "auto":
+        return torch.cuda.is_available()
+    try:
+        return torch.device(env_device).type == "cuda"
+    except Exception:
+        return False
+
+
+def _debug_backend_preflight_error(cuda_training: bool, gsplat_available: bool) -> str | None:
+    """Return an actionable setup error if training would hit CUDA PyTorch fallback."""
+    if cuda_training and not gsplat_available:
+        return (
+            "CUDA training is selected but `gsplat` is not installed. "
+            "Paper-scale debug runs can OOM on the PyTorch fallback rasterizer. "
+            "Relaunch with `uv run --extra debug --extra cuda bezier-debug`, "
+            "or set `BEZIER_TRAIN_DEVICE=cpu`."
+        )
+    return None
 
 
 def _load_checkpoint_payload(path: Path) -> dict:
@@ -472,8 +515,8 @@ def create_inspector_app(debug_output_dir: str | Path | None = None):
         "scan": _scan_output_dir(output_dir),
     }
 
-    # Default resolution
-    default_H, default_W = 64, 64
+    # Default render dimensions for exploration tabs.
+    default_H, default_W = PAPER_DEFAULT_RESOLUTION, PAPER_DEFAULT_RESOLUTION
 
     with gr.Blocks(title="Bezier Splatting Inspector") as app:
         gr.Markdown("# Bezier Splatting Debug Inspector")
@@ -573,30 +616,40 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
     gr.Markdown("## Parameters")
 
     first_params = SUGGESTED_PARAMS.get(sample_names[0], {}) if sample_names else {}
+    first_resolution = int(first_params.get("resolution", PAPER_DEFAULT_RESOLUTION))
+    first_lr_scale = float(first_params.get("lr_scale", _paper_lr_scale(first_resolution)))
 
     with gr.Row():
         resolution_slider = gr.Slider(
-            minimum=64, maximum=512, value=64, step=64,
+            minimum=64, maximum=PAPER_MAX_RESOLUTION, value=first_resolution, step=64,
             label="Resolution (H = W)",
         )
         n_open_slider = gr.Slider(
-            minimum=0, maximum=512, value=first_params.get("n_open", 16), step=1,
+            minimum=0, maximum=PAPER_MAX_CURVES, value=first_params.get("n_open", 1024), step=1,
             label="Open Curves",
         )
         n_closed_slider = gr.Slider(
-            minimum=0, maximum=512, value=first_params.get("n_closed", 8), step=1,
+            minimum=0, maximum=PAPER_MAX_CURVES, value=first_params.get("n_closed", 512), step=1,
             label="Closed Curves",
         )
         steps_slider = gr.Slider(
-            minimum=200, maximum=5000, value=first_params.get("steps", 1000), step=100,
+            minimum=1000, maximum=20000, value=first_params.get("steps", PAPER_CLOSED_STEPS), step=100,
             label="Training Steps",
         )
 
     with gr.Row():
         lr_scale_slider = gr.Slider(
-            minimum=0.1, maximum=10.0, value=1.0, step=0.1,
-            label="LR Scale (multiplier on all learning rates)",
+            minimum=0.05, maximum=5.0, value=first_lr_scale, step=0.01,
+            label="LR Scale (paper CP LR=2e-4 at chosen resolution)",
         )
+    gr.Markdown(
+        (
+            f"*Paper-aligned defaults: open steps={PAPER_OPEN_STEPS}, closed steps={PAPER_CLOSED_STEPS}, "
+            f"open samples/curve={PAPER_SAMPLES_PER_OPEN}, "
+            f"closed samples/curve={PAPER_SAMPLES_PER_CLOSED_CURVE}, "
+            f"closed intermediate curves={PAPER_NUM_INTERMEDIATE}.*"
+        )
+    )
 
     # -- Run --
     gr.Markdown("## Run")
@@ -657,24 +710,26 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
     def on_sample_change(sample_name, resolution):
         """Update preview and suggested params when a built-in sample is selected."""
         if sample_name not in sample_targets:
-            return None, gr.update(), gr.update(), gr.update()
-
-        res = int(resolution)
-        target = sample_targets[sample_name](res, res)
-        preview = _tensor_to_display(target)
+            return None, gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
 
         params = SUGGESTED_PARAMS.get(sample_name, {})
+        res = int(params.get("resolution", resolution))
+        target = sample_targets[sample_name](res, res)
+        preview = _tensor_to_display(target)
+        lr_scale = float(params.get("lr_scale", _paper_lr_scale(res)))
         return (
             preview,
-            gr.update(value=params.get("n_open", 16)),
-            gr.update(value=params.get("n_closed", 8)),
-            gr.update(value=params.get("steps", 1000)),
+            gr.update(value=res),
+            gr.update(value=params.get("n_open", 1024)),
+            gr.update(value=params.get("n_closed", 512)),
+            gr.update(value=params.get("steps", PAPER_OPEN_STEPS if params.get("n_closed", 0) == 0 else PAPER_CLOSED_STEPS)),
+            gr.update(value=lr_scale),
         )
 
     sample_dropdown.change(
         fn=on_sample_change,
         inputs=[sample_dropdown, resolution_slider],
-        outputs=[preview_image, n_open_slider, n_closed_slider, steps_slider],
+        outputs=[preview_image, resolution_slider, n_open_slider, n_closed_slider, steps_slider, lr_scale_slider],
     )
 
     def on_kodak_change(kodak_name, resolution):
@@ -706,7 +761,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
     )
 
     def on_resolution_change(resolution, source, sample_name, kodak_name, upload_path):
-        """Re-generate preview at new resolution."""
+        """Re-generate preview and paper-aligned LR scale at new resolution."""
         res = int(resolution)
         if source == "Built-in Samples" and sample_name in sample_targets:
             target = sample_targets[sample_name](res, res)
@@ -715,13 +770,13 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         elif source == "Upload Image" and upload_path is not None:
             target = load_image(upload_path, res, res)
         else:
-            return None
-        return _tensor_to_display(target)
+            return None, gr.update()
+        return _tensor_to_display(target), gr.update(value=_paper_lr_scale(res))
 
     resolution_slider.change(
         fn=on_resolution_change,
         inputs=[resolution_slider, source_radio, sample_dropdown, kodak_dropdown, upload_image],
-        outputs=[preview_image],
+        outputs=[preview_image, lr_scale_slider],
     )
 
     def run_training(
@@ -740,6 +795,25 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         lr_scale = float(lr_scale)
         H = W = res
         current_output = str(app_state["output_dir"]) if app_state.get("output_dir") is not None else None
+        backend_error = _debug_backend_preflight_error(
+            cuda_training=_cuda_training_selected(),
+            gsplat_available=_check_gsplat(),
+        )
+        if backend_error is not None:
+            yield (
+                state,
+                f"*Error: {backend_error}*",
+                None,
+                None,
+                None,
+                None,
+                None,
+                "",
+                [],
+                current_output,
+                gr.update(),
+            )
+            return
 
         # Resolve target image
         if source == "Built-in Samples":
@@ -844,6 +918,9 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
                     steps=steps,
                     log_every=max(1, steps // 40),
                     lr_scale=lr_scale,
+                    samples_per_open=PAPER_SAMPLES_PER_OPEN,
+                    samples_per_closed_curve=PAPER_SAMPLES_PER_CLOSED_CURVE,
+                    num_intermediate=PAPER_NUM_INTERMEDIATE,
                     callback=callback,
                     callback_requires_loss=False,
                     debug=str(output_dir),
@@ -1083,8 +1160,8 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
     # Generate initial preview on app load
     if sample_names:
         app.load(
-            fn=lambda: on_sample_change(sample_names[0], 64),
-            outputs=[preview_image, n_open_slider, n_closed_slider, steps_slider],
+            fn=lambda: on_sample_change(sample_names[0], first_resolution),
+            outputs=[preview_image, resolution_slider, n_open_slider, n_closed_slider, steps_slider, lr_scale_slider],
         )
 
 

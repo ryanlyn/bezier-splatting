@@ -64,13 +64,15 @@ class TestAnimationConfig:
         assert cfg.fps == 10
         assert cfg.last_frame_hold == 3.0
         assert cfg.panel_size is None
+        assert cfg.max_size_mb == 8.0
 
     def test_custom_values(self):
-        cfg = AnimationConfig(layout="full", target_frames=60, fps=20, panel_size=256)
+        cfg = AnimationConfig(layout="full", target_frames=60, fps=20, panel_size=256, max_size_mb=8.0)
         assert cfg.layout == "full"
         assert cfg.target_frames == 60
         assert cfg.fps == 20
         assert cfg.panel_size == 256
+        assert cfg.max_size_mb == 8.0
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +344,32 @@ class TestGIFExport:
             rec.export(gif_path)
             assert gif_path.exists()
             assert gif_path.stat().st_size > 0
+
+    def test_export_respects_max_size_limit(self, target_tensor, tmp_path):
+        config = AnimationConfig(
+            layout="standard",
+            target_frames=80,
+            fps=12,
+            panel_size=256,
+            max_size_mb=0.02,  # 20KB to force adaptive compression path
+        )
+        rec = FrameRecorder(config, target_tensor, 16, 16)
+        for step in range(120):
+            rec.maybe_capture(
+                step,
+                119,
+                torch.rand(3, 16, 16),
+                loss=0.5,
+                psnr=20.0,
+                n_open=2,
+                n_closed=1,
+            )
+
+        gif_path = tmp_path / "compressed.gif"
+        rec.export(gif_path)
+
+        assert gif_path.exists()
+        assert gif_path.stat().st_size <= int(config.max_size_mb * 1024 * 1024)
 
 
 # ---------------------------------------------------------------------------

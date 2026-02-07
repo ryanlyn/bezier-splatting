@@ -1,5 +1,6 @@
 """Backend configuration plumbing tests."""
 
+import warnings
 from unittest.mock import patch
 
 import pytest
@@ -92,6 +93,26 @@ def test_gsplat_not_installed_raises_clear_error():
     with patch("bezier_splatting.rasterizer._check_gsplat", return_value=False):
         with pytest.raises(ImportError, match="gsplat.*not installed"):
             _resolve_backend("gsplat", cuda)
+
+
+def test_auto_backend_on_cuda_warns_when_gsplat_missing():
+    """Auto backend warns before falling back to pytorch on CUDA without gsplat."""
+    cuda = torch.device("cuda")
+    with patch("bezier_splatting.rasterizer._check_gsplat", return_value=False):
+        with pytest.warns(RuntimeWarning, match="resolved to `pytorch` on CUDA"):
+            resolved = _resolve_backend("auto", cuda)
+    assert resolved == "pytorch"
+
+
+def test_auto_backend_on_cuda_no_warning_when_gsplat_available():
+    """Auto backend resolves to gsplat silently when gsplat is available."""
+    cuda = torch.device("cuda")
+    with patch("bezier_splatting.rasterizer._check_gsplat", return_value=True):
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            resolved = _resolve_backend("auto", cuda)
+    assert resolved == "gsplat"
+    assert len(record) == 0
 
 
 def test_unknown_backend_raises_value_error():

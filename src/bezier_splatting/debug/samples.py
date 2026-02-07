@@ -153,11 +153,40 @@ def get_sample_targets() -> dict[str, Callable[..., Tensor]]:
 
 
 SUGGESTED_PARAMS: dict[str, dict] = {
-    "Circle (closed curves)": {"n_open": 0, "n_closed": 8, "steps": 1000},
-    "Overlapping Rectangles (depth + alpha)": {"n_open": 0, "n_closed": 16, "steps": 1500},
-    "Star Strokes (open curves)": {"n_open": 32, "n_closed": 0, "steps": 2000},
-    "Color Gradient (smooth fills)": {"n_open": 16, "n_closed": 16, "steps": 1500},
-    "Composition (mixed curves)": {"n_open": 32, "n_closed": 16, "steps": 2000},
+    # Paper-aligned presets:
+    # - Open curves are commonly evaluated at 256/512/1024 (and up to 2048 in speed/qualitative results)
+    # - Closed curves are commonly evaluated at 256/512/1024
+    # - Steps: 15k (open), 10k (closed)
+    "Circle (closed curves)": {
+        "resolution": 1024,
+        "n_open": 0,
+        "n_closed": 512,
+        "steps": 10000,
+    },
+    "Overlapping Rectangles (depth + alpha)": {
+        "resolution": 1024,
+        "n_open": 0,
+        "n_closed": 512,
+        "steps": 10000,
+    },
+    "Star Strokes (open curves)": {
+        "resolution": 1024,
+        "n_open": 1024,
+        "n_closed": 0,
+        "steps": 15000,
+    },
+    "Color Gradient (smooth fills)": {
+        "resolution": 1024,
+        "n_open": 512,
+        "n_closed": 512,
+        "steps": 10000,
+    },
+    "Composition (mixed curves)": {
+        "resolution": 1024,
+        "n_open": 1024,
+        "n_closed": 512,
+        "steps": 10000,
+    },
 }
 
 

@@ -7,6 +7,7 @@ import torch
 from bezier_splatting.debug.checkpoints import save_checkpoint
 from bezier_splatting.debug.collectors import snapshot_scene
 from bezier_splatting.debug.assertions import check_health
+from bezier_splatting.debug.inspector import _debug_backend_preflight_error
 from bezier_splatting.debug.samples import load_image
 from bezier_splatting.debug.viz import _scene_from_checkpoint, _scene_from_snapshot
 from bezier_splatting.model import VectorGraphicsScene
@@ -108,3 +109,16 @@ def test_check_health_handles_cuda_dead_curve_tracking():
 
     assert isinstance(warnings, list)
     assert "dead_steps" in history
+
+
+def test_debug_preflight_requires_gsplat_for_cuda_training():
+    msg = _debug_backend_preflight_error(cuda_training=True, gsplat_available=False)
+
+    assert msg is not None
+    assert "gsplat" in msg
+    assert "--extra cuda" in msg
+
+
+def test_debug_preflight_allows_non_cuda_or_gsplat_available():
+    assert _debug_backend_preflight_error(cuda_training=False, gsplat_available=False) is None
+    assert _debug_backend_preflight_error(cuda_training=True, gsplat_available=True) is None
