@@ -348,6 +348,14 @@ class TestComputeDensifyCenters:
         centers = compute_densify_centers(rendered, target, 0, 64, 64)
         assert centers.shape == (0, 2)
 
+    def test_tiny_image_no_divide_by_zero(self):
+        """Very small images should not trigger zero-sized densify cells."""
+        rendered = torch.zeros(3, 4, 4)
+        target = torch.ones(3, 4, 4)
+        centers = compute_densify_centers(rendered, target, 2, 4, 4)
+        assert centers.shape[1] == 2
+        assert centers.shape[0] <= 2
+
     def test_hotspots_at_error_regions(self):
         """Centers concentrate near high-error regions."""
         rendered = torch.zeros(3, 64, 64)
@@ -376,7 +384,7 @@ class TestComputeColorDistance:
     """Test pairwise color distance computation."""
 
     def test_same_colors_zero_distance(self):
-        """Identical pre-sigmoid colors have zero distance."""
+        """Identical colors have zero distance."""
         colors = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
         cdist = compute_color_distance(colors)
         assert cdist[0, 1].item() == pytest.approx(0.0, abs=1e-5)

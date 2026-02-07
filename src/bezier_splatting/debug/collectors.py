@@ -117,7 +117,7 @@ def collect_curve_stats(scene: VectorGraphicsScene, H: int, W: int) -> dict:
             sampler = scene.open_sampler
             gp = sampler(
                 scene.open_control_points,
-                torch.sigmoid(scene.open_colors),
+                scene.open_colors.clamp(0.0, 1.0),
                 scene.open_opacities,
                 scene.open_stroke_widths,
                 H, W,

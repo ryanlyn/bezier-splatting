@@ -76,6 +76,74 @@ def _tensor_to_numpy_image(tensor: Tensor) -> np.ndarray:
     return t.clamp(0, 1).numpy()
 
 
+def _fig_to_numpy(fig: Figure) -> np.ndarray:
+    """Convert a matplotlib Figure to an (H, W, 3) uint8 numpy array."""
+    fig.canvas.draw()
+    buf = fig.canvas.buffer_rgba()
+    arr = np.asarray(buf)
+    plt.close(fig)
+    return arr[:, :, :3]
+
+
+def compute_error_map(rendered: Tensor, target: Tensor) -> np.ndarray:
+    """Compute a colorized L1 error heatmap as (H, W, 3) uint8 numpy.
+
+    Args:
+        rendered: (3, H, W) rendered image tensor.
+        target: (3, H, W) target image tensor.
+
+    Returns:
+        (H, W, 3) uint8 numpy array with hot-colormap error visualization.
+    """
+    import matplotlib.cm as cm
+
+    error = (rendered.detach().cpu() - target.detach().cpu()).abs().mean(dim=0).numpy()  # (H, W)
+    error_max = error.max()
+    if error_max > 0:
+        error_norm = error / error_max
+    else:
+        error_norm = error
+    colored = (cm.hot(error_norm)[:, :, :3] * 255).astype(np.uint8)
+    return colored
+
+
+def make_loss_chart(
+    losses: list[float],
+    psnrs: list[float],
+    current_step: int,
+    total_steps: int,
+) -> np.ndarray:
+    """Create a matplotlib loss+PSNR dual chart, returned as (H, W, 3) uint8 numpy.
+
+    Args:
+        losses: List of loss values per step.
+        psnrs: List of PSNR values per step.
+        current_step: Current training step (for chart title).
+        total_steps: Total training steps (for chart title).
+
+    Returns:
+        (H, W, 3) uint8 numpy array of the chart.
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 3), dpi=100)
+    steps = list(range(len(losses)))
+
+    ax1.plot(steps, losses, "b-", linewidth=1)
+    ax1.set_xlabel("Update")
+    ax1.set_ylabel("Loss")
+    ax1.set_yscale("log")
+    ax1.set_title(f"Loss (step {current_step}/{total_steps})")
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(steps, psnrs, "g-", linewidth=1)
+    ax2.set_xlabel("Update")
+    ax2.set_ylabel("PSNR (dB)")
+    ax2.set_title(f"PSNR: {psnrs[-1]:.1f} dB" if psnrs else "PSNR")
+    ax2.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    return _fig_to_numpy(fig)
+
+
 def _scene_from_snapshot(snapshot: dict) -> VectorGraphicsScene:
     """Reconstruct a VectorGraphicsScene from a snapshot dict (from snapshot_scene).
 

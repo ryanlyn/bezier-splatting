@@ -78,13 +78,13 @@ def _closed_interior_weights(
         biased = 0.5 - 0.5 * torch.cos(torch.pi * uniform.pow(1.0 / boundary_bias))
         return biased[1:-1]
 
-    if mode == "official_cdf":
+    if mode == "cdf":
         # Official-style mode: Normal CDF over [-2, 2], no explicit endpoint rows.
         grid = torch.linspace(-2, 2, num_intermediate, device=device, dtype=dtype)
         return 0.5 * (1.0 + torch.erf(grid / math.sqrt(2.0) / 0.85))
 
     raise ValueError(
-        f"Unknown sampling mode {mode!r}. Expected 'boundary_biased' or 'official_cdf'.",
+        f"Unknown sampling mode {mode!r}. Expected 'boundary_biased' or 'cdf'.",
     )
 
 

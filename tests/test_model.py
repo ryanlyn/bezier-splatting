@@ -28,6 +28,6 @@ class TestClosedSamplingMode:
             n_closed=1,
             H=32,
             W=32,
-            closed_sampling_mode="official_cdf",
+            closed_sampling_mode="cdf",
         )
-        assert scene.closed_sampler.sampling_mode == "official_cdf"
+        assert scene.closed_sampler.sampling_mode == "cdf"
