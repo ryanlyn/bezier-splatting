@@ -148,12 +148,17 @@ def _render_curve_overlay(scene: VectorGraphicsScene, H: int, W: int) -> np.ndar
         if closed_opacities.ndim == 2:
             closed_opacities = closed_opacities.mean(dim=-1)
 
-        # Compute first-intermediate-curve weight for boundary σ_y estimation
+        # Compute first-intermediate-curve weight for boundary σ_y estimation.
+        # Must match the sampling mode the sampler actually uses.
+        from ..sampling import _closed_interior_weights
+
         rho = scene.closed_sampler.rho
-        R_total = scene.closed_sampler.num_intermediate + 2
+        R = scene.closed_sampler.num_intermediate
+        R_total = R + 2
+        mode = scene.closed_sampler.sampling_mode
         bias = scene.closed_sampler.boundary_bias
-        u1 = 1.0 / (R_total - 1)
-        w1 = 0.5 - 0.5 * math.cos(math.pi * u1 ** (1.0 / bias))
+        interior_w = _closed_interior_weights(R, mode, bias, torch.float32, torch.device("cpu"))
+        w1 = interior_w[0].item() if len(interior_w) > 0 else 0.5
         t_probe = torch.linspace(0, 1, 8)
 
         for i in range(scene.n_closed):
@@ -170,13 +175,13 @@ def _render_curve_overlay(scene: VectorGraphicsScene, H: int, W: int) -> np.ndar
             area = closed_curve_enclosed_area(bcp.unsqueeze(0))[0].item()
 
             # Estimate boundary σ_y: distance from boundary curve to
-            # first intermediate curve, divided by ρ.  This determines
-            # how far the rendered Gaussians bleed beyond the exact boundary.
+            # first intermediate curve, divided by ρ, then apply the
+            # same [0.75, 1.0] clamp the rasterizer uses (sampling.py).
             interp1_cp = (1 - w1) * top + w1 * bot  # (CP, 2)
             top_pts = evaluate_bezier(top.unsqueeze(0), t_probe)[0]
             int1_pts = evaluate_bezier(interp1_cp.unsqueeze(0), t_probe)[0]
             cross_d = torch.sqrt(((top_pts - int1_pts) ** 2).sum(-1) + 1e-12)
-            sigma_y = (cross_d / rho).clamp(min=0.1).mean().item()
+            sigma_y = (cross_d / rho).clamp(min=0.75, max=1.0).mean().item()
             # Stroke expands outward by ~2σ (half the linewidth goes outward)
             border_lw = 4 * sigma_y * pts_per_px
 
@@ -191,8 +196,11 @@ def _render_curve_overlay(scene: VectorGraphicsScene, H: int, W: int) -> np.ndar
                     verts.append(top[j].tolist())
                     codes.append(MplPath.CURVE4)
             else:
-                for j in range(1, num_cp):
-                    verts.append(top[j].tolist())
+                # Non-cubic: evaluate as polyline for smooth rendering
+                t_poly = torch.linspace(0, 1, 32)
+                top_polyline = evaluate_bezier(top.unsqueeze(0), t_poly)[0]
+                for j in range(1, len(top_polyline)):
+                    verts.append(top_polyline[j].tolist())
                     codes.append(MplPath.LINETO)
 
             # Line to bottom end
@@ -205,8 +213,9 @@ def _render_curve_overlay(scene: VectorGraphicsScene, H: int, W: int) -> np.ndar
                     verts.append(bot[j].tolist())
                     codes.append(MplPath.CURVE4)
             else:
-                for j in range(num_cp - 2, -1, -1):
-                    verts.append(bot[j].tolist())
+                bot_polyline = evaluate_bezier(bot.unsqueeze(0), t_poly)[0]
+                for j in range(len(bot_polyline) - 2, -1, -1):
+                    verts.append(bot_polyline[j].tolist())
                     codes.append(MplPath.LINETO)
 
             # CLOSEPOLY needs its own dummy vertex — don't overwrite the last CURVE4
@@ -571,11 +580,11 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
             label="Resolution (H = W)",
         )
         n_open_slider = gr.Slider(
-            minimum=0, maximum=64, value=first_params.get("n_open", 16), step=1,
+            minimum=0, maximum=512, value=first_params.get("n_open", 16), step=1,
             label="Open Curves",
         )
         n_closed_slider = gr.Slider(
-            minimum=0, maximum=64, value=first_params.get("n_closed", 8), step=1,
+            minimum=0, maximum=512, value=first_params.get("n_closed", 8), step=1,
             label="Closed Curves",
         )
         steps_slider = gr.Slider(
@@ -825,12 +834,28 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
             capture = _LogCapture(sys.stdout, log_lines)
             sys.stdout = capture
             try:
+                # Scale topology schedule for short runs.  The defaults
+                # (topology_start_step=1000, prune_stop_before_end=1000)
+                # assume 15k steps.  For the interactive debugger we scale
+                # proportionally so pruning/densification still fires.
+                ref_steps = 15000
+                topo_start = max(100, int(1000 * steps / ref_steps))
+                prune_stop = max(100, int(1000 * steps / ref_steps))
+                prune_every = max(50, int(400 * steps / ref_steps))
+                # Ensure the window [topo_start, steps - prune_stop) is non-empty
+                if topo_start >= steps - prune_stop:
+                    topo_start = max(1, steps // 4)
+                    prune_stop = max(1, steps // 4)
+
                 result_holder[0] = fit_image(
                     target,
                     n_open=n_open,
                     n_closed=n_closed,
                     steps=steps,
-                    log_every=max(1, steps // 10),
+                    prune_every=prune_every,
+                    prune_stop_before_end=prune_stop,
+                    topology_start_step=topo_start,
+                    log_every=max(1, steps // 40),
                     lr_scale=lr_scale,
                     callback=callback,
                     debug=str(output_dir),
@@ -860,10 +885,18 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         yield (state, "**Training started...**", None, None, None,
                None, None, "", [], str(output_dir), gr.update(interactive=False))
 
+        last_log_len = 0  # track log lines already yielded
+
         while True:
             try:
-                data = data_queue.get(timeout=1.0)
+                data = data_queue.get(timeout=0.3)
             except queue.Empty:
+                # No image data yet — but yield a log-only update if new lines appeared
+                if len(log_lines) > last_log_len:
+                    last_log_len = len(log_lines)
+                    yield (state, gr.update(), gr.update(), gr.update(),
+                           gr.update(), gr.update(), gr.update(),
+                           "\n".join(log_lines), gr.update(), gr.update(), gr.update())
                 if not thread.is_alive():
                     break
                 continue
@@ -890,12 +923,6 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
             psnr = compute_psnr(rendered_cpu, target).item()
             psnr_history.append(psnr)
 
-            # Capture frame for animation export
-            recorder.maybe_capture(
-                step, steps, rendered_cpu, loss, psnr,
-                data["n_open"], data["n_closed"],
-            )
-
             chart_np = make_loss_chart(loss_history, psnr_history, step, steps)
             last_chart_np = chart_np
 
@@ -911,12 +938,20 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
             if svg_image is not None:
                 last_svg_np = svg_image
 
+            # Capture frame for animation export (after SVG is available)
+            recorder.maybe_capture(
+                step, steps, rendered_cpu, loss, psnr,
+                data["n_open"], data["n_closed"],
+                svg_overlay=last_svg_np,
+            )
+
             status = (
                 f"**Step {step}/{steps}** | Loss: {loss:.5f} | "
                 f"PSNR: {psnr:.1f} dB | "
                 f"Curves: {data['n_open']} open + {data['n_closed']} closed"
             )
 
+            last_log_len = len(log_lines)
             yield (state, status, last_rendered_np, last_error_np,
                    last_ellipse_np, last_svg_np, last_chart_np,
                    "\n".join(log_lines), [], str(output_dir), gr.update())
