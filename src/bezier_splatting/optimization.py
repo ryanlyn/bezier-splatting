@@ -201,7 +201,7 @@ def fit_image(
     samples_per_open: int | None = None,
     samples_per_closed_curve: int | None = None,
     num_intermediate: int | None = None,
-    raster_backend: str = "mps",
+    raster_backend: str = "auto",
     raster_tile_size: int = 16,
     raster_chunk_size: int = 16,
     train_device: str | torch.device | None = None,
@@ -240,7 +240,9 @@ def fit_image(
         samples_per_open: Optional override for open-curve sample count.
         samples_per_closed_curve: Optional override for per-row closed sample count.
         num_intermediate: Optional override for closed interior row count.
-        raster_backend: Rasterizer backend (``"auto"``, ``"reference"``, ``"mps"``).
+        raster_backend: Rasterizer backend (``"auto"``, ``"pytorch"``, ``"gsplat"``).
+            ``"auto"`` prefers gsplat on CUDA, falls back to pytorch.
+            ``"reference"`` and ``"mps"`` are accepted as aliases for ``"pytorch"``.
         raster_tile_size: Tile size used by the rasterizer.
         raster_chunk_size: Chunk size used by the rasterizer.
         train_device: Device for optimization. ``None`` uses
@@ -273,6 +275,8 @@ def fit_image(
     def _resolve_auto_device() -> torch.device:
         if input_device.type != "cpu":
             return input_device
+        if torch.cuda.is_available():
+            return torch.device("cuda")
         if not torch.backends.mps.is_available():
             return input_device
         # Empirical heuristic: small open-only workloads are currently faster
@@ -289,7 +293,7 @@ def fit_image(
             else:
                 device = torch.device(env_device)
         else:
-            device = input_device
+            device = _resolve_auto_device()
     elif isinstance(train_device, str) and train_device == "auto":
         device = _resolve_auto_device()
     else:

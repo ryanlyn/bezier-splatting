@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib>=3.10.8",
     "numpy>=2.4.2",
     "pillow>=12.1.0",
+    "setuptools>=80.10.2",
     "torch>=2.10.0",
 ]
 
@@ -19,6 +20,9 @@ dependencies = [
 bezier-debug = "bezier_splatting.debug.inspector:main"
 
 [project.optional-dependencies]
+cuda = [
+    "gsplat>=1.0",
+]
 debug = ["trackio", "gradio>=5.0.0"]
 
 [build-system]

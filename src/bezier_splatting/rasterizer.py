@@ -1,8 +1,10 @@
 """Tile-based differentiable 2D Gaussian splatting rasterizer.
 
 Provides two backends:
-- ``reference``: original implementation, optimized for readability.
-- ``mps``: vectorized tile path that minimizes Python loops on Apple MPS.
+- ``pytorch``: pure-PyTorch implementation that works on all devices (CPU, CUDA, MPS).
+- ``gsplat``: CUDA-accelerated backend using the gsplat library (requires CUDA device).
+
+Legacy backend strings ``"reference"`` and ``"mps"`` are accepted as aliases for ``"pytorch"``.
 
 Both backends are differentiable and return identical shapes.
 """
@@ -13,20 +15,29 @@ from torch import Tensor
 
 from .sampling import GaussianParams
 
-RasterBackend = str  # Literal["auto", "reference", "mps"]
+RasterBackend = str  # Literal["auto", "pytorch", "gsplat", "reference", "mps"]
+
+
+def _check_gsplat() -> bool:
+    """Check whether the gsplat library is importable."""
+    try:
+        import gsplat  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 def _build_covariance(
     scales: Float[Tensor, "G 2"],
     rotations: Float[Tensor, " G"],
 ) -> Float[Tensor, "G 2 2"]:
-    """Build 2×2 covariance matrices from scales and rotations.
+    """Build 2x2 covariance matrices from scales and rotations.
 
-    Σ = R @ diag(σ²) @ R^T
+    Sigma = R @ diag(sigma^2) @ R^T
 
     Args:
-        scales: (G, 2) — [σ_x, σ_y]
-        rotations: (G,) — angle θ in radians
+        scales: (G, 2) -- [sigma_x, sigma_y]
+        rotations: (G,) -- angle theta in radians
 
     Returns:
         Covariance matrices (G, 2, 2).
@@ -36,12 +47,12 @@ def _build_covariance(
 
     # Rotation matrix columns
     # R = [[cos, -sin], [sin, cos]]
-    # Σ = R @ diag(σ²) @ R^T
-    sx2 = scales[:, 0] ** 2  # σ_x²
-    sy2 = scales[:, 1] ** 2  # σ_y²
+    # Sigma = R @ diag(sigma^2) @ R^T
+    sx2 = scales[:, 0] ** 2  # sigma_x^2
+    sy2 = scales[:, 1] ** 2  # sigma_y^2
 
-    # Expanded: Σ = [[cos²σx² + sin²σy², cossin(σx²-σy²)],
-    #                [cossin(σx²-σy²), sin²σx² + cos²σy²]]
+    # Expanded: Sigma = [[cos^2*sx2 + sin^2*sy2, cos*sin*(sx2-sy2)],
+    #                     [cos*sin*(sx2-sy2), sin^2*sx2 + cos^2*sy2]]
     a = cos ** 2 * sx2 + sin ** 2 * sy2
     b = cos * sin * (sx2 - sy2)
     d = sin ** 2 * sx2 + cos ** 2 * sy2
@@ -55,15 +66,15 @@ def _build_covariance(
 
 
 def _invert_2x2(cov: Float[Tensor, "G 2 2"]) -> tuple[Float[Tensor, "G 2 2"], Float[Tensor, " G"]]:
-    """Analytic inverse of 2×2 symmetric positive-definite matrices.
+    """Analytic inverse of 2x2 symmetric positive-definite matrices.
 
-    [[a, b], [b, d]]⁻¹ = (1/det) * [[d, -b], [-b, a]]
+    [[a, b], [b, d]]^-1 = (1/det) * [[d, -b], [-b, a]]
 
     Args:
         cov: (G, 2, 2) covariance matrices
 
     Returns:
-        (inv_cov, det) — inverse covariance (G, 2, 2) and determinant (G,)
+        (inv_cov, det) -- inverse covariance (G, 2, 2) and determinant (G,)
     """
     a = cov[:, 0, 0]
     b = cov[:, 0, 1]
@@ -82,27 +93,43 @@ def _invert_2x2(cov: Float[Tensor, "G 2 2"]) -> tuple[Float[Tensor, "G 2 2"], Fl
 
 
 def _resolve_backend(backend: RasterBackend, device: torch.device) -> str:
-    """Resolve ``auto`` backend choice based on tensor device."""
-    if backend == "auto":
-        if device.type == "mps":
-            return "mps"
-        return "reference"
+    """Resolve backend choice based on tensor device and library availability.
 
-    if backend in {"reference", "mps"}:
-        return backend
+    Returns ``"pytorch"`` or ``"gsplat"``.
+    """
+    if backend == "auto":
+        if device.type == "cuda" and _check_gsplat():
+            return "gsplat"
+        return "pytorch"
+
+    if backend in {"pytorch", "mps", "reference"}:
+        return "pytorch"
+
+    if backend in {"gsplat", "cuda_gsplat"}:
+        if device.type != "cuda":
+            raise ValueError(
+                f"gsplat backend requires a CUDA device, got {device.type!r}",
+            )
+        if not _check_gsplat():
+            raise ImportError(
+                "gsplat backend requested but the gsplat library is not installed. "
+                "Install it with: pip install gsplat",
+            )
+        return "gsplat"
 
     raise ValueError(
-        f"Unknown raster backend: {backend!r} (expected 'auto', 'reference', or 'mps')",
+        f"Unknown raster backend: {backend!r} "
+        f"(expected 'auto', 'pytorch', 'gsplat', 'reference', or 'mps')",
     )
 
 
-def _default_mps_chunk_size(
+def _default_pytorch_chunk_size(
     H: int,
     W: int,
     tile_size: int,
     n_gaussians: int,
 ) -> int:
-    """Choose a robust MPS chunk size for common workload regimes."""
+    """Choose a robust chunk size for common workload regimes."""
     n_tiles_x = (W + tile_size - 1) // tile_size
     n_tiles_y = (H + tile_size - 1) // tile_size
     n_tiles = n_tiles_x * n_tiles_y
@@ -120,190 +147,7 @@ def _default_mps_chunk_size(
     return min(64, n_tiles)
 
 
-def _rasterize_reference(
-    gaussians: GaussianParams,
-    H: int,
-    W: int,
-    bg_color: Float[Tensor, " 3"] | None = None,
-    tile_size: int = 16,
-    chunk_size: int = 16,
-) -> Float[Tensor, "3 H W"]:
-    """Reference tile rasterizer.
-
-    This is the original implementation, kept for correctness and fallback.
-    """
-    device = gaussians.means.device
-    dtype = gaussians.means.dtype
-    G = gaussians.means.shape[0]
-
-    if bg_color is None:
-        bg_color = torch.ones(3, device=device, dtype=dtype)
-
-    if G == 0:
-        return bg_color[:, None, None].expand(3, H, W).clone()
-
-    # ── 1. Covariance matrices and bounding boxes ─────────────────────
-    cov = _build_covariance(gaussians.scales, gaussians.rotations)  # (G, 2, 2)
-    inv_cov, _ = _invert_2x2(cov)  # (G, 2, 2), (G,)
-
-    # 3σ bounding radius in x and y
-    # For an axis-aligned bound, use sqrt of diagonal elements of Σ
-    radius_x = 3.0 * torch.sqrt(cov[:, 0, 0])  # (G,)
-    radius_y = 3.0 * torch.sqrt(cov[:, 1, 1])
-
-    means = gaussians.means  # (G, 2)
-    # Bounding box in pixel coords: [x_min, y_min, x_max, y_max]
-    bb_min_x = means[:, 0] - radius_x
-    bb_min_y = means[:, 1] - radius_y
-    bb_max_x = means[:, 0] + radius_x
-    bb_max_y = means[:, 1] + radius_y
-
-    # ── 2. Vectorized tile assignment ─────────────────────────────────
-    n_tiles_x = (W + tile_size - 1) // tile_size
-    n_tiles_y = (H + tile_size - 1) // tile_size
-    n_tiles = n_tiles_x * n_tiles_y
-
-    tile_min_x = torch.clamp((bb_min_x / tile_size).floor().int(), 0, n_tiles_x - 1)
-    tile_min_y = torch.clamp((bb_min_y / tile_size).floor().int(), 0, n_tiles_y - 1)
-    tile_max_x = torch.clamp((bb_max_x / tile_size).ceil().int(), 0, n_tiles_x - 1)
-    tile_max_y = torch.clamp((bb_max_y / tile_size).ceil().int(), 0, n_tiles_y - 1)
-
-    tile_ys = torch.arange(n_tiles_y, device=device)
-    tile_xs = torch.arange(n_tiles_x, device=device)
-    in_y = (tile_min_y[:, None] <= tile_ys) & (tile_ys <= tile_max_y[:, None])  # (G, TY)
-    in_x = (tile_min_x[:, None] <= tile_xs) & (tile_xs <= tile_max_x[:, None])  # (G, TX)
-    membership = (in_y[:, :, None] & in_x[:, None, :])  # (G, TY, TX)
-    membership = membership.reshape(G, n_tiles)  # (G, T)
-
-    gaussians_per_tile = membership.sum(dim=0)  # (T,)
-
-    # ── 3. Pre-build pixel grid ───────────────────────────────────────
-    opacities = torch.sigmoid(gaussians.opacities)  # (G,)
-    colors = gaussians.colors  # (G, 3)
-
-    px_x = torch.arange(W, device=device, dtype=dtype) + 0.5
-    px_y = torch.arange(H, device=device, dtype=dtype) + 0.5
-    grid_y, grid_x = torch.meshgrid(px_y, px_x, indexing="ij")
-    pixel_grid = torch.stack([grid_x, grid_y], dim=-1)  # (H, W, 2)
-
-    # ── 4. Chunked batched rendering ──────────────────────────────────
-    image = torch.zeros(3, H, W, device=device, dtype=dtype)
-
-    tile_order = torch.argsort(gaussians_per_tile)  # ascending by Gaussian count
-    tile_start = 0
-
-    while tile_start < n_tiles:
-        tile_end = min(tile_start + chunk_size, n_tiles)
-        chunk_tile_ids = tile_order[tile_start:tile_end]  # flat tile indices in this chunk
-        n_chunk = chunk_tile_ids.shape[0]
-
-        chunk_counts = gaussians_per_tile[chunk_tile_ids]  # (n_chunk,)
-        max_T = int(chunk_counts.max().item())
-
-        if max_T == 0:
-            for ci in range(n_chunk):
-                flat_tid = chunk_tile_ids[ci].item()
-                ty = flat_tid // n_tiles_x
-                tx = flat_tid % n_tiles_x
-                px_sy = ty * tile_size
-                px_sx = tx * tile_size
-                px_ey = min(px_sy + tile_size, H)
-                px_ex = min(px_sx + tile_size, W)
-                image[:, px_sy:px_ey, px_sx:px_ex] = bg_color[:, None, None]
-            tile_start = tile_end
-            continue
-
-        # Build padded index tensors for the chunk: (n_chunk, max_T)
-        # Membership columns for the chunk tiles: (G, n_chunk)
-        chunk_membership = membership[:, chunk_tile_ids]  # (G, n_chunk)
-
-        # For each tile in the chunk, collect sorted Gaussian indices
-        padded_idx = torch.zeros(n_chunk, max_T, device=device, dtype=torch.long)
-        valid_mask = torch.zeros(n_chunk, max_T, device=device, dtype=torch.bool)
-
-        for ci in range(n_chunk):
-            g_ids = chunk_membership[:, ci].nonzero(as_tuple=False).squeeze(-1)
-            n_g = g_ids.shape[0]
-            if n_g > 0:
-                padded_idx[ci, :n_g] = g_ids
-                valid_mask[ci, :n_g] = True
-
-        # Gather Gaussian data: (n_chunk, max_T, ...)
-        flat_idx = padded_idx.reshape(-1)  # (n_chunk * max_T,)
-        g_means = means[flat_idx].reshape(n_chunk, max_T, 2)
-        g_inv_cov = inv_cov[flat_idx].reshape(n_chunk, max_T, 2, 2)
-        g_opacities = opacities[flat_idx].reshape(n_chunk, max_T)
-        g_colors = colors[flat_idx].reshape(n_chunk, max_T, 3)
-
-        # Zero out padding opacities so they don't contribute
-        g_opacities = g_opacities * valid_mask.float()
-
-        # Collect pixel grids for each tile in the chunk: (n_chunk, tile_size, tile_size, 2)
-        # Edge tiles may be smaller; pad to tile_size × tile_size
-        chunk_pixels = torch.zeros(n_chunk, tile_size, tile_size, 2, device=device, dtype=dtype)
-        tile_heights = []
-        tile_widths = []
-
-        for ci in range(n_chunk):
-            flat_tid = chunk_tile_ids[ci].item()
-            ty = flat_tid // n_tiles_x
-            tx = flat_tid % n_tiles_x
-            px_sy = ty * tile_size
-            px_sx = tx * tile_size
-            px_ey = min(px_sy + tile_size, H)
-            px_ex = min(px_sx + tile_size, W)
-            th = px_ey - px_sy
-            tw = px_ex - px_sx
-            tile_heights.append(th)
-            tile_widths.append(tw)
-            chunk_pixels[ci, :th, :tw, :] = pixel_grid[px_sy:px_ey, px_sx:px_ex, :]
-
-        # Displacement: (n_chunk, max_T, tile_size, tile_size, 2)
-        d = chunk_pixels[:, None, :, :, :] - g_means[:, :, None, None, :]
-
-        # Mahalanobis: einsum over the 2D displacement with inverse covariance
-        d_transformed = torch.einsum("ctpqi,ctij->ctpqj", d, g_inv_cov)
-        mahal = 0.5 * (d * d_transformed).sum(dim=-1)  # (n_chunk, max_T, tile_size, tile_size)
-
-        # Alpha: (n_chunk, max_T, tile_size, tile_size)
-        alpha = g_opacities[:, :, None, None] * torch.exp(-mahal)
-        alpha = torch.clamp(alpha, 0.0, 0.99)
-
-        # Front-to-back compositing along the Gaussian dimension (dim=1)
-        one_minus_alpha = 1.0 - alpha  # (n_chunk, max_T, tile_size, tile_size)
-
-        transmittance = torch.ones_like(alpha)
-        if max_T > 1:
-            transmittance[:, 1:] = torch.cumprod(one_minus_alpha[:, :-1], dim=1)
-
-        weights = alpha * transmittance  # (n_chunk, max_T, tile_size, tile_size)
-
-        # Weighted color: g_colors (n_chunk, max_T, 3), weights (n_chunk, max_T, tile_size, tile_size)
-        rendered = torch.einsum("ntk,ntpq->nkpq", g_colors, weights)
-
-        # Remaining transmittance via reuse of cumprod result
-        remaining_T = transmittance[:, -1:] * one_minus_alpha[:, -1:]  # (n_chunk, 1, tile_size, tile_size)
-        remaining_T = remaining_T.squeeze(1)  # (n_chunk, tile_size, tile_size)
-
-        rendered = rendered + bg_color[None, :, None, None] * remaining_T[:, None, :, :]
-
-        # Write results back to the output image
-        for ci in range(n_chunk):
-            flat_tid = chunk_tile_ids[ci].item()
-            ty = flat_tid // n_tiles_x
-            tx = flat_tid % n_tiles_x
-            px_sy = ty * tile_size
-            px_sx = tx * tile_size
-            th = tile_heights[ci]
-            tw = tile_widths[ci]
-            image[:, px_sy:px_sy + th, px_sx:px_sx + tw] = rendered[ci, :, :th, :tw]
-
-        tile_start = tile_end
-
-    return image
-
-
-def _rasterize_mps(
+def _rasterize_pytorch(
     gaussians: GaussianParams,
     H: int,
     W: int,
@@ -311,7 +155,7 @@ def _rasterize_mps(
     tile_size: int = 16,
     chunk_size: int = 64,
 ) -> Float[Tensor, "3 H W"]:
-    """Vectorized tile rasterizer tuned for MPS.
+    """Pure-PyTorch tile rasterizer that works on all devices (CPU, CUDA, MPS).
 
     Design goals:
     - Keep computation on device (avoid frequent host syncs).
@@ -424,7 +268,7 @@ def _rasterize_mps(
         d_y = px_y[:, None, :, :] - g_means[:, :, None, None, 1]
 
         # For inverse covariance [[a, b], [b, d]]:
-        # 0.5 * [dx,dy] Σ^-1 [dx,dy]^T = 0.5 * (a*dx^2 + 2b*dx*dy + d*dy^2)
+        # 0.5 * [dx,dy] Sigma^-1 [dx,dy]^T = 0.5 * (a*dx^2 + 2b*dx*dy + d*dy^2)
         a = g_inv_cov[:, :, 0, 0][:, :, None, None]
         b = g_inv_cov[:, :, 0, 1][:, :, None, None]
         d = g_inv_cov[:, :, 1, 1][:, :, None, None]
@@ -452,6 +296,96 @@ def _rasterize_mps(
     return image_pad[:, :H, :W]
 
 
+def _rasterize_gsplat(
+    gaussians: GaussianParams,
+    H: int,
+    W: int,
+    bg_color: Float[Tensor, " 3"] | None = None,
+    tile_size: int = 16,
+) -> Float[Tensor, "3 H W"]:
+    """CUDA-accelerated rasterizer using gsplat low-level primitives.
+
+    Requires a CUDA device and the gsplat library (``pip install gsplat``).
+    Gaussians must arrive pre-sorted by depth (model handles this).
+    """
+    from gsplat import isect_tiles, isect_offset_encode, rasterize_to_pixels
+
+    device = gaussians.means.device
+    dtype = gaussians.means.dtype
+    G = gaussians.means.shape[0]
+
+    if bg_color is None:
+        bg_color = torch.ones(3, device=device, dtype=dtype)
+
+    if G == 0:
+        return bg_color[:, None, None].expand(3, H, W).clone()
+
+    # gsplat expects post-sigmoid opacities in [0, 1].
+    opacities = torch.sigmoid(gaussians.opacities)
+
+    # Compute conics (Σ⁻¹ upper triangle) and radii directly from scales/rotations
+    # without allocating intermediate (G, 2, 2) tensors.
+    cos = torch.cos(gaussians.rotations)
+    sin = torch.sin(gaussians.rotations)
+    sx2 = gaussians.scales[:, 0] ** 2
+    sy2 = gaussians.scales[:, 1] ** 2
+
+    # Covariance diagonal + off-diagonal (scalar components).
+    cov_a = cos * cos * sx2 + sin * sin * sy2  # Σ[0,0]
+    cov_b = cos * sin * (sx2 - sy2)            # Σ[0,1]
+    cov_d = sin * sin * sx2 + cos * cos * sy2  # Σ[1,1]
+
+    det = (cov_a * cov_d - cov_b * cov_b).clamp(min=1e-8)
+    inv_det = 1.0 / det
+    conics = torch.stack([cov_d * inv_det, -cov_b * inv_det, cov_a * inv_det], dim=-1)  # (G, 3)
+
+    # Per-axis radii: 3σ bounding in each axis, rounded up. (G, 2) int32.
+    radii = torch.stack([
+        (3.0 * torch.sqrt(cov_a)).ceil(),
+        (3.0 * torch.sqrt(cov_d)).ceil(),
+    ], dim=-1).int()  # (G, 2)
+
+    # Synthetic monotonic depths — Gaussians are already globally sorted by
+    # the model, so monotonic indices preserve that order in gsplat's per-tile
+    # radix sort.
+    depths = torch.arange(G, device=device, dtype=torch.float32)
+
+    means2d = gaussians.means.contiguous()  # (G, 2)
+    colors = gaussians.colors.contiguous()  # (G, 3)
+
+    tile_width = (W + tile_size - 1) // tile_size
+    tile_height = (H + tile_size - 1) // tile_size
+
+    # Tile intersection bookkeeping — isect_tiles needs batch dim (1, G, ...).
+    _, isect_ids, flatten_ids = isect_tiles(
+        means2d.unsqueeze(0),   # (1, G, 2)
+        radii.unsqueeze(0),     # (1, G, 2)
+        depths.unsqueeze(0),    # (1, G)
+        tile_size,
+        tile_width,
+        tile_height,
+    )
+    isect_offsets = isect_offset_encode(isect_ids, 1, tile_width, tile_height)
+
+    # gsplat rasterize_to_pixels expects batch dims [C, ...] where C=1.
+    # Parameter order is (image_width, image_height) — i.e. (W, H).
+    rendered, _ = rasterize_to_pixels(
+        means2d.unsqueeze(0),         # (1, G, 2)
+        conics.unsqueeze(0),          # (1, G, 3)
+        colors.unsqueeze(0),          # (1, G, 3)
+        opacities.unsqueeze(0),       # (1, G)
+        W,                            # image_width
+        H,                            # image_height
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+        backgrounds=bg_color.unsqueeze(0),  # (1, 3)
+    )
+
+    # rendered: (1, H, W, 3) → (3, H, W)
+    return rendered.squeeze(0).permute(2, 0, 1)
+
+
 def rasterize(
     gaussians: GaussianParams,
     H: int,
@@ -469,40 +403,40 @@ def rasterize(
         bg_color: Background color (3,). Defaults to white.
         tile_size: Tile size in pixels.
         chunk_size: Number of tiles processed in parallel.
-        backend: ``"mps"`` (default), ``"auto"``, or ``"reference"``.
+        backend: ``"pytorch"`` (default), ``"auto"``, ``"gsplat"``,
+                 or legacy aliases ``"mps"``/``"reference"``.
 
     Returns:
         Rendered image (3, H, W) in [0, 1].
     """
     resolved = _resolve_backend(backend, gaussians.means.device)
 
-    if resolved == "reference":
-        return _rasterize_reference(
-            gaussians,
-            H,
-            W,
-            bg_color=bg_color,
-            tile_size=tile_size,
-            chunk_size=chunk_size,
-        )
-
-    if resolved == "mps":
-        # Preserve explicit chunk override; otherwise auto-tune for MPS.
-        mps_chunk = chunk_size
+    if resolved == "pytorch":
+        # Preserve explicit chunk override; otherwise auto-tune.
+        pytorch_chunk = chunk_size
         if chunk_size == 16:
-            mps_chunk = _default_mps_chunk_size(
+            pytorch_chunk = _default_pytorch_chunk_size(
                 H,
                 W,
                 tile_size,
                 gaussians.means.shape[0],
             )
-        return _rasterize_mps(
+        return _rasterize_pytorch(
             gaussians,
             H,
             W,
             bg_color=bg_color,
             tile_size=tile_size,
-            chunk_size=mps_chunk,
+            chunk_size=pytorch_chunk,
+        )
+
+    if resolved == "gsplat":
+        return _rasterize_gsplat(
+            gaussians,
+            H,
+            W,
+            bg_color=bg_color,
+            tile_size=tile_size,
         )
 
     raise RuntimeError(f"Unreachable backend resolution: {resolved!r}")
