@@ -46,9 +46,12 @@ from .samples import (
     get_sample_targets,
     load_image,
 )
+from .animation import AnimationConfig, FrameRecorder
 from .viz import (
     _scene_from_checkpoint,
     _tensor_to_numpy_image,
+    compute_error_map,
+    make_loss_chart,
     render_ellipse_overlay,
     render_gradient_heatmap,
     render_layer_decomposition,
@@ -226,7 +229,7 @@ def _render_curve_overlay(scene: VectorGraphicsScene, H: int, W: int) -> np.ndar
             if opacity < 0.01:
                 continue
             cp = model_to_pixel(scene.open_control_points[i].detach().cpu(), H, W)  # (10, 2)
-            color = torch.sigmoid(scene.open_colors[i]).detach().cpu().tolist()
+            color = scene.open_colors[i].clamp(0.0, 1.0).detach().cpu().tolist()
             sw = 0.5 + torch.sigmoid(scene.open_stroke_widths[i]).detach().cpu().item() * 4.5
 
             edge_len = torch.norm(cp[1:] - cp[:-1], dim=-1).sum().item()
@@ -296,47 +299,6 @@ def _upscale_image(img: np.ndarray, min_size: int = 384) -> np.ndarray:
     pil = PILImage.fromarray(img)
     pil = pil.resize((new_w, new_h), PILImage.NEAREST)
     return np.array(pil)
-
-
-def _compute_error_map(rendered: Tensor, target: Tensor) -> np.ndarray:
-    """Compute a colorized L1 error heatmap as (H, W, 3) uint8 numpy."""
-    import matplotlib.cm as cm
-
-    error = (rendered.detach().cpu() - target.detach().cpu()).abs().mean(dim=0).numpy()  # (H, W)
-    error_max = error.max()
-    if error_max > 0:
-        error_norm = error / error_max
-    else:
-        error_norm = error
-    colored = (cm.hot(error_norm)[:, :, :3] * 255).astype(np.uint8)
-    return colored
-
-
-def _make_loss_chart(
-    losses: list[float],
-    psnrs: list[float],
-    current_step: int,
-    total_steps: int,
-) -> np.ndarray:
-    """Create a matplotlib loss+PSNR dual chart, returned as (H, W, 3) uint8 numpy."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 3), dpi=100)
-    steps = list(range(len(losses)))
-
-    ax1.plot(steps, losses, "b-", linewidth=1)
-    ax1.set_xlabel("Update")
-    ax1.set_ylabel("Loss")
-    ax1.set_yscale("log")
-    ax1.set_title(f"Loss (step {current_step}/{total_steps})")
-    ax1.grid(True, alpha=0.3)
-
-    ax2.plot(steps, psnrs, "g-", linewidth=1)
-    ax2.set_xlabel("Update")
-    ax2.set_ylabel("PSNR (dB)")
-    ax2.set_title(f"PSNR: {psnrs[-1]:.1f} dB" if psnrs else "PSNR")
-    ax2.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    return _fig_to_numpy(fig)
 
 
 def _detach_gaussians(g: GaussianParams) -> GaussianParams:
@@ -650,10 +612,19 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
     # -- Final result gallery (shown after training completes) --
     result_gallery = gr.Gallery(label="Training Result", columns=3, height="auto")
 
+    # -- Export Animation --
+    with gr.Accordion("Export Animation", open=False):
+        anim_layout = gr.Radio(
+            ["minimal", "standard", "full"], value="standard", label="Layout"
+        )
+        anim_fps = gr.Slider(5, 30, value=10, step=1, label="FPS")
+        export_btn = gr.Button("Export GIF", interactive=False)
+        anim_file = gr.File(label="Download GIF")
+
     # Shared mutable state for stop signaling across Gradio threads.
     # The generator (run_training) creates a fresh Event each run and stores it
     # here. The stop button handler reads and sets it.
-    train_state = gr.State(value={"event": None})
+    train_state = gr.State(value={"event": None, "recorder": None})
 
     # -- Event handlers --
 
@@ -762,27 +733,31 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         if source == "Built-in Samples":
             if sample_name not in sample_targets:
                 yield (state, "*Error: no sample selected.*", None, None, None,
-                       None, None, "", [], current_output)
+                       None, None, "", [], current_output, gr.update())
                 return
             target = sample_targets[sample_name](res, res)
         elif source == "Kodak Samples":
             if kodak_name not in kodak_samples:
                 yield (state, "*Error: no Kodak image selected.*", None, None, None,
-                       None, None, "", [], current_output)
+                       None, None, "", [], current_output, gr.update())
                 return
             target = load_image(kodak_samples[kodak_name], res, res)
         elif source == "Upload Image":
             if upload_path is None:
                 yield (state, "*Error: no image uploaded.*", None, None, None,
-                       None, None, "", [], current_output)
+                       None, None, "", [], current_output, gr.update())
                 return
             target = load_image(upload_path, res, res)
         else:
             yield (state, "*Error: unknown source.*", None, None, None,
-                   None, None, "", [], current_output)
+                   None, None, "", [], current_output, gr.update())
             return
 
         output_dir = Path(tempfile.mkdtemp(prefix="bezier_debug_"))
+
+        # Create frame recorder for GIF export
+        recorder = FrameRecorder(AnimationConfig(), target, H, W)
+        state["recorder"] = recorder
 
         stop_event = threading.Event()
         state["event"] = stop_event
@@ -883,7 +858,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
 
         # Initial yield: show "training started" status
         yield (state, "**Training started...**", None, None, None,
-               None, None, "", [], str(output_dir))
+               None, None, "", [], str(output_dir), gr.update(interactive=False))
 
         while True:
             try:
@@ -899,7 +874,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
             if "error" in data:
                 yield (state, f"**Error:** {data['error']}", last_rendered_np,
                        last_error_np, last_ellipse_np, last_svg_np, last_chart_np,
-                       "\n".join(log_lines), [], str(output_dir))
+                       "\n".join(log_lines), [], str(output_dir), gr.update())
                 break
 
             step = data["step"]
@@ -907,7 +882,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
             rendered_cpu = data["rendered"]
 
             rendered_np = _tensor_to_display(rendered_cpu, min_size=384)
-            error_np = _upscale_image(_compute_error_map(rendered_cpu, target), min_size=384)
+            error_np = _upscale_image(compute_error_map(rendered_cpu, target), min_size=384)
             last_rendered_np = rendered_np
             last_error_np = error_np
 
@@ -915,7 +890,13 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
             psnr = compute_psnr(rendered_cpu, target).item()
             psnr_history.append(psnr)
 
-            chart_np = _make_loss_chart(loss_history, psnr_history, step, steps)
+            # Capture frame for animation export
+            recorder.maybe_capture(
+                step, steps, rendered_cpu, loss, psnr,
+                data["n_open"], data["n_closed"],
+            )
+
+            chart_np = make_loss_chart(loss_history, psnr_history, step, steps)
             last_chart_np = chart_np
 
             gaussians = data.get("gaussians")
@@ -938,7 +919,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
 
             yield (state, status, last_rendered_np, last_error_np,
                    last_ellipse_np, last_svg_np, last_chart_np,
-                   "\n".join(log_lines), [], str(output_dir))
+                   "\n".join(log_lines), [], str(output_dir), gr.update())
 
         thread.join(timeout=30)
 
@@ -950,10 +931,10 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
                 final_psnr = compute_psnr(final_rendered, target).item()
 
             final_rendered_np = _tensor_to_display(final_rendered, min_size=384)
-            final_error_np = _upscale_image(_compute_error_map(final_rendered.cpu(), target), min_size=384)
+            final_error_np = _upscale_image(compute_error_map(final_rendered.cpu(), target), min_size=384)
 
             if loss_history:
-                final_chart = _make_loss_chart(
+                final_chart = make_loss_chart(
                     loss_history, psnr_history, steps - 1, steps,
                 )
             else:
@@ -983,12 +964,13 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
             final_log = "\n".join(log_lines)
             yield (state, final_status, final_rendered_np, final_error_np,
                    last_ellipse_np, last_svg_np, final_chart, final_log,
-                   gallery_images, str(output_dir))
+                   gallery_images, str(output_dir), gr.update(interactive=True))
         else:
             err_msg = error_holder[0] or "Unknown error"
             yield (state, f"**Training failed:** `{err_msg}`",
                    last_rendered_np, last_error_np, last_ellipse_np,
-                   last_svg_np, last_chart_np, "\n".join(log_lines), [], str(output_dir))
+                   last_svg_np, last_chart_np, "\n".join(log_lines), [], str(output_dir),
+                   gr.update())
 
     def stop_training(state):
         """Signal the training thread to stop early."""
@@ -1007,6 +989,7 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         outputs=[
             train_state, status_text, live_rendered, live_error,
             live_ellipses, live_svg, live_chart, log_output, result_gallery, output_dir_state,
+            export_btn,
         ],
     )
 
@@ -1015,6 +998,22 @@ def _build_train_tab(gr, app, app_state, render_h, render_w, output_dir_state):
         inputs=[train_state],
         outputs=[train_state, status_text],
         cancels=[train_event],
+    )
+
+    def export_gif(state, layout, fps):
+        """Export the recorded training frames as an animated GIF."""
+        recorder = state.get("recorder")
+        if recorder is None or recorder.frame_count == 0:
+            return None
+        recorder._config = AnimationConfig(layout=layout, fps=int(fps))
+        gif_dir = Path(tempfile.mkdtemp(prefix="bezier_gif_"))
+        path = recorder.export(gif_dir / "training.gif")
+        return str(path)
+
+    export_btn.click(
+        fn=export_gif,
+        inputs=[train_state, anim_layout, anim_fps],
+        outputs=[anim_file],
     )
 
     # Generate initial preview on app load

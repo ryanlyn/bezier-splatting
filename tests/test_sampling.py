@@ -169,7 +169,7 @@ class TestClosedCurveSampler:
         sampler = ClosedCurveSampler(
             num_intermediate=R,
             samples_per_curve=K,
-            sampling_mode="official_cdf",
+            sampling_mode="cdf",
         )
         # Top boundary near y=+0.6, bottom near y=-0.6
         bcp = torch.tensor([[
@@ -215,7 +215,7 @@ class TestClosedCurveSampler:
         torch.testing.assert_close(row_op, expected)
 
     def test_modes_produce_different_interior_layout(self):
-        """official_cdf and boundary_biased modes should differ on interior placement."""
+        """cdf and boundary_biased modes should differ on interior placement."""
         R = 10
         K = 8
         bcp = torch.rand(1, 2, 4, 2) * 2 - 1
@@ -230,7 +230,7 @@ class TestClosedCurveSampler:
         g_cdf = ClosedCurveSampler(
             num_intermediate=R,
             samples_per_curve=K,
-            sampling_mode="official_cdf",
+            sampling_mode="cdf",
         )(bcp, colors, opacities, H=128, W=128)
 
         # Compare interior rows only (rows 2+), flattened.

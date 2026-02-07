@@ -120,7 +120,7 @@ class TestPruneOptimizerState:
         assert found
 
     def test_no_state_noop(self):
-        """Prune on a param with no state (no steps taken) does nothing."""
+        """Prune updates param refs even when optimizer state has not been created."""
         param = nn.Parameter(torch.randn(4, 2))
         opt = Adan([{"params": [param], "lr": 0.01}])
         # No steps taken, so no state
@@ -129,8 +129,10 @@ class TestPruneOptimizerState:
         new_param = nn.Parameter(param[mask].clone())
         _prune_optimizer_state(opt, param, new_param, mask)
 
-        # Should not crash and new_param should not have state
+        # No state is created, but param refs must still be updated.
         assert new_param not in opt.state
+        assert opt.param_groups[0]["params"][0] is new_param
+        assert opt.param_groups[0]["params"][0] is not param
 
     def test_step_counter_preserved(self):
         """Step counter is preserved across prune, not reset to 0."""
@@ -237,7 +239,7 @@ class TestExtendOptimizerState:
         assert new_param in opt.state
 
     def test_no_state_noop(self):
-        """Extend on a param with no state does nothing."""
+        """Extend updates param refs even when optimizer state has not been created."""
         param = nn.Parameter(torch.randn(3, 2))
         opt = Adan([{"params": [param], "lr": 0.01}])
 
@@ -246,6 +248,8 @@ class TestExtendOptimizerState:
         _extend_optimizer_state(opt, param, new_param, n_new)
 
         assert new_param not in opt.state
+        assert opt.param_groups[0]["params"][0] is new_param
+        assert opt.param_groups[0]["params"][0] is not param
 
 
 # ── Splice tests ─────────────────────────────────────────────────────────
@@ -303,6 +307,20 @@ class TestSpliceOptimizerState:
         for key in ("exp_avg", "exp_avg_sq", "exp_avg_diff", "neg_pre_grad"):
             spliced = state[key][insert_idx:insert_idx + n_new]
             assert (spliced == 0).all(), f"{key} spliced entries should be zero"
+
+    def test_no_state_still_references_new_param(self):
+        """Splice updates param refs even when optimizer state has not been created."""
+        param = nn.Parameter(torch.randn(4, 1))
+        opt = Adan([{"params": [param], "lr": 0.01}])
+
+        insert_idx = 2
+        n_new = 2
+        new_param = nn.Parameter(torch.cat([param[:insert_idx], torch.ones(n_new, 1), param[insert_idx:]]))
+        _splice_optimizer_state(opt, param, new_param, insert_idx, n_new)
+
+        assert new_param not in opt.state
+        assert opt.param_groups[0]["params"][0] is new_param
+        assert opt.param_groups[0]["params"][0] is not param
 
 
 # ── Round-trip tests ─────────────────────────────────────────────────────

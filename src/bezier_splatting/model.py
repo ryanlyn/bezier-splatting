@@ -36,7 +36,7 @@ class VectorGraphicsScene(nn.Module):
         samples_per_open: int = 20,
         samples_per_closed_curve: int = 15,
         num_intermediate: int = 20,
-        closed_sampling_mode: str = "official_cdf",
+        closed_sampling_mode: str = "cdf",
         raster_backend: RasterBackend = "mps",
         raster_tile_size: int = 16,
         raster_chunk_size: int = 16,
@@ -184,7 +184,7 @@ class VectorGraphicsScene(nn.Module):
         if n_open > 0:
             open_g = self.open_sampler(
                 self.open_control_points,
-                torch.sigmoid(self.open_colors),
+                self.open_colors.clamp(0.0, 1.0),
                 self.open_opacities,
                 self.open_stroke_widths,
                 H, W,

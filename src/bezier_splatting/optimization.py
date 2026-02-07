@@ -32,6 +32,16 @@ from .topology import (
 # ── Optimizer State Surgery ──────────────────────────────────────────────
 
 
+def _replace_param_reference(
+    optimizer: torch.optim.Optimizer,
+    old_param: nn.Parameter,
+    new_param: nn.Parameter,
+) -> None:
+    """Replace ``old_param`` with ``new_param`` in all optimizer param groups."""
+    for group in optimizer.param_groups:
+        group["params"] = [new_param if p is old_param else p for p in group["params"]]
+
+
 def _prune_optimizer_state(
     optimizer: torch.optim.Optimizer,
     old_param: nn.Parameter,
@@ -50,26 +60,20 @@ def _prune_optimizer_state(
         mask: Boolean mask over dim 0, True = keep.
     """
     state = optimizer.state.get(old_param)
-    if state is None:
-        return
+    if state is not None:
+        new_state: dict = {"step": state.get("step", 0)}
+        for key, val in state.items():
+            if key == "step":
+                continue
+            if isinstance(val, Tensor) and val.shape[0] == mask.shape[0]:
+                new_state[key] = val[mask].clone()
+            else:
+                new_state[key] = val
 
-    new_state: dict = {"step": state.get("step", 0)}
-    for key, val in state.items():
-        if key == "step":
-            continue
-        if isinstance(val, Tensor) and val.shape[0] == mask.shape[0]:
-            new_state[key] = val[mask].clone()
-        else:
-            new_state[key] = val
+        del optimizer.state[old_param]
+        optimizer.state[new_param] = new_state
 
-    del optimizer.state[old_param]
-    optimizer.state[new_param] = new_state
-
-    for group in optimizer.param_groups:
-        for i, p in enumerate(group["params"]):
-            if p is old_param:
-                group["params"][i] = new_param
-                return
+    _replace_param_reference(optimizer, old_param, new_param)
 
 
 def _extend_optimizer_state(
@@ -90,29 +94,23 @@ def _extend_optimizer_state(
         n_new: Number of new entries appended along dim 0.
     """
     state = optimizer.state.get(old_param)
-    if state is None:
-        return
+    if state is not None:
+        new_state: dict = {"step": state.get("step", 0)}
+        for key, val in state.items():
+            if key == "step":
+                continue
+            if isinstance(val, Tensor):
+                extension = torch.zeros(
+                    n_new, *val.shape[1:], device=val.device, dtype=val.dtype,
+                )
+                new_state[key] = torch.cat([val, extension], dim=0)
+            else:
+                new_state[key] = val
 
-    new_state: dict = {"step": state.get("step", 0)}
-    for key, val in state.items():
-        if key == "step":
-            continue
-        if isinstance(val, Tensor):
-            extension = torch.zeros(
-                n_new, *val.shape[1:], device=val.device, dtype=val.dtype,
-            )
-            new_state[key] = torch.cat([val, extension], dim=0)
-        else:
-            new_state[key] = val
+        del optimizer.state[old_param]
+        optimizer.state[new_param] = new_state
 
-    del optimizer.state[old_param]
-    optimizer.state[new_param] = new_state
-
-    for group in optimizer.param_groups:
-        for i, p in enumerate(group["params"]):
-            if p is old_param:
-                group["params"][i] = new_param
-                return
+    _replace_param_reference(optimizer, old_param, new_param)
 
 
 def _splice_optimizer_state(
@@ -135,31 +133,25 @@ def _splice_optimizer_state(
         n_new: Number of new entries inserted.
     """
     state = optimizer.state.get(old_param)
-    if state is None:
-        return
+    if state is not None:
+        new_state: dict = {"step": state.get("step", 0)}
+        for key, val in state.items():
+            if key == "step":
+                continue
+            if isinstance(val, Tensor):
+                before = val[:insert_idx]
+                after = val[insert_idx:]
+                middle = torch.zeros(
+                    n_new, *val.shape[1:], device=val.device, dtype=val.dtype,
+                )
+                new_state[key] = torch.cat([before, middle, after], dim=0)
+            else:
+                new_state[key] = val
 
-    new_state: dict = {"step": state.get("step", 0)}
-    for key, val in state.items():
-        if key == "step":
-            continue
-        if isinstance(val, Tensor):
-            before = val[:insert_idx]
-            after = val[insert_idx:]
-            middle = torch.zeros(
-                n_new, *val.shape[1:], device=val.device, dtype=val.dtype,
-            )
-            new_state[key] = torch.cat([before, middle, after], dim=0)
-        else:
-            new_state[key] = val
+        del optimizer.state[old_param]
+        optimizer.state[new_param] = new_state
 
-    del optimizer.state[old_param]
-    optimizer.state[new_param] = new_state
-
-    for group in optimizer.param_groups:
-        for i, p in enumerate(group["params"]):
-            if p is old_param:
-                group["params"][i] = new_param
-                return
+    _replace_param_reference(optimizer, old_param, new_param)
 
 
 # ── Training Loop ────────────────────────────────────────────────────────
@@ -199,12 +191,16 @@ def fit_image(
     lr_gamma: float = 0.5,
     lr_scale: float = 1.0,
     optimizer_type: str = "adam",
-    loss_preset: str = "official_closed",
-    topology_schedule: str = "official_alternating",
+    loss_preset: str = "closed",
+    topology_schedule: str = "alternating",
     topology_start_step: int = 1000,
     topology_max_step_open: int = 14000,
     topology_max_step_closed: int = 9200,
-    closed_sampling_mode: str = "official_cdf",
+    closed_sampling_mode: str = "cdf",
+    sampling_profile: str = "balanced",
+    samples_per_open: int | None = None,
+    samples_per_closed_curve: int | None = None,
+    num_intermediate: int | None = None,
     raster_backend: str = "mps",
     raster_tile_size: int = 16,
     raster_chunk_size: int = 16,
@@ -227,18 +223,23 @@ def fit_image(
             is ``None`` (backward compatibility). When a ``LossConfig`` is
             provided, its ``lambda_xing`` takes precedence.
         loss_preset: Default loss stack when ``loss_config`` is ``None``.
-            ``"official_closed"`` matches official closed-mode training terms.
+            ``"closed"`` matches paper-style closed-mode training terms.
             ``"minimal"`` keeps reconstruction-only behavior.
             ``"custom"`` requires an explicit ``loss_config``.
         topology_schedule: ``"unified"`` (prune+densify same step) or
-            ``"official_alternating"`` (alternating prune/densify phases).
+            ``"alternating"`` (alternating prune/densify phases).
         topology_start_step: First step eligible for topology operations in
             alternating schedule.
         topology_max_step_open: Hard stop for topology in open-only runs.
         topology_max_step_closed: Hard stop for topology when closed curves
             are present.
         closed_sampling_mode: Closed sampler mode forwarded to
-            ``VectorGraphicsScene`` (``"official_cdf"`` or ``"boundary_biased"``).
+            ``VectorGraphicsScene`` (``"cdf"`` or ``"boundary_biased"``).
+        sampling_profile: Built-in sampling profile:
+            ``"balanced"`` (current defaults) or ``"dense"`` (higher-fidelity).
+        samples_per_open: Optional override for open-curve sample count.
+        samples_per_closed_curve: Optional override for per-row closed sample count.
+        num_intermediate: Optional override for closed interior row count.
         raster_backend: Rasterizer backend (``"auto"``, ``"reference"``, ``"mps"``).
         raster_tile_size: Tile size used by the rasterizer.
         raster_chunk_size: Chunk size used by the rasterizer.
@@ -301,7 +302,7 @@ def fit_image(
 
     # Build loss config from preset unless caller provides explicit config.
     if loss_config is None:
-        if loss_preset == "official_closed":
+        if loss_preset == "closed":
             loss_config = LossConfig(
                 loss_type="L2",
                 lambda_xing=lambda_xing,
@@ -327,8 +328,37 @@ def fit_image(
         else:
             raise ValueError(
                 f"Unknown loss_preset: {loss_preset!r}. "
-                "Expected 'official_closed', 'minimal', or 'custom'.",
+                "Expected 'closed', 'minimal', or 'custom'.",
             )
+
+    sampling_presets = {
+        "balanced": {
+            "samples_per_open": 20,
+            "samples_per_closed_curve": 15,
+            "num_intermediate": 20,
+        },
+        "dense": {
+            "samples_per_open": 64,
+            "samples_per_closed_curve": 64,
+            "num_intermediate": 40,
+        },
+    }
+    if sampling_profile not in sampling_presets:
+        raise ValueError(
+            f"Unknown sampling_profile: {sampling_profile!r}. Expected 'balanced' or 'dense'.",
+        )
+    preset = sampling_presets[sampling_profile]
+    resolved_samples_per_open = (
+        samples_per_open if samples_per_open is not None else preset["samples_per_open"]
+    )
+    resolved_samples_per_closed_curve = (
+        samples_per_closed_curve
+        if samples_per_closed_curve is not None
+        else preset["samples_per_closed_curve"]
+    )
+    resolved_num_intermediate = (
+        num_intermediate if num_intermediate is not None else preset["num_intermediate"]
+    )
 
     if debug:
         from .debug import (
@@ -360,6 +390,10 @@ def fit_image(
                 "raster_tile_size": raster_tile_size,
                 "raster_chunk_size": raster_chunk_size,
                 "train_device": str(device),
+                "sampling_profile": sampling_profile,
+                "samples_per_open": resolved_samples_per_open,
+                "samples_per_closed_curve": resolved_samples_per_closed_curve,
+                "num_intermediate": resolved_num_intermediate,
             },
         )
         health_history: dict = {}
@@ -369,6 +403,9 @@ def fit_image(
         n_closed=n_closed,
         H=H,
         W=W,
+        samples_per_open=resolved_samples_per_open,
+        samples_per_closed_curve=resolved_samples_per_closed_curve,
+        num_intermediate=resolved_num_intermediate,
         closed_sampling_mode=closed_sampling_mode,
         raster_backend=raster_backend,
         raster_tile_size=raster_tile_size,
@@ -478,7 +515,7 @@ def fit_image(
                         do_prune=True,
                         do_densify=True,
                     )
-        elif topology_schedule == "official_alternating":
+        elif topology_schedule == "alternating":
             hard_stop = (
                 topology_max_step_closed if scene.n_closed > 0 else topology_max_step_open
             )
@@ -531,7 +568,7 @@ def fit_image(
         else:
             raise ValueError(
                 f"Unknown topology_schedule: {topology_schedule!r}. "
-                "Expected 'unified' or 'official_alternating'.",
+                "Expected 'unified' or 'alternating'.",
             )
 
         if did_topology and debug:
@@ -811,7 +848,7 @@ def _densify_curves(
         return
 
     # Find error hotspots via grid cells
-    cell_size = max(H, W) // 8
+    cell_size = max(1, max(H, W) // 8)
     n_cells_y = (H + cell_size - 1) // cell_size
     n_cells_x = (W + cell_size - 1) // cell_size
 
@@ -862,16 +899,15 @@ def _densify_curves(
         # Initialize color from target at center (logit space)
         px = int(min(max(cx_px, 0), W - 1))
         py = int(min(max(cy_px, 0), H - 1))
-        color = target[:, py, px].detach().clone()
-        color = torch.clamp(color, 0.01, 0.99)
-        color = torch.log(color / (1.0 - color))  # logit (inverse sigmoid)
+        color_rgb = target[:, py, px].detach().clone().clamp(0.0, 1.0)
+        color_closed = torch.logit(color_rgb.clamp(0.01, 0.99))
 
         # High aspect -> edge-like -> open curve, else closed curve
         if aspect > 2.0 or scene.n_closed == 0:
-            _make_open_curve(cx_px, cy_px, H, W, color, device, new_open_cps, new_open_colors)
+            _make_open_curve(cx_px, cy_px, H, W, color_rgb, device, new_open_cps, new_open_colors)
         else:
             _make_closed_curve(
-                cx_px, cy_px, H, W, closed_cp_count, color, device,
+                cx_px, cy_px, H, W, closed_cp_count, color_closed, device,
                 new_closed_cps, new_closed_colors,
             )
 
@@ -954,10 +990,6 @@ def _densify_curves(
         if parts:
             new_depth_param = nn.Parameter(torch.cat(parts, dim=0))
             if optimizer is not None:
-                # Depth splice: insert new_open entries after existing open,
-                # then append new_closed at the end. Use general splice for
-                # the open insertion and extend for the closed append.
-                # Simpler: build state manually to match the new layout.
                 state = optimizer.state.get(old_depth_param)
                 if state is not None:
                     new_state: dict = {"step": state.get("step", 0)}
@@ -981,11 +1013,7 @@ def _densify_curves(
                             new_state[key] = val
                     del optimizer.state[old_depth_param]
                     optimizer.state[new_depth_param] = new_state
-                    for group in optimizer.param_groups:
-                        for i, p in enumerate(group["params"]):
-                            if p is old_depth_param:
-                                group["params"][i] = new_depth_param
-                                break
+                _replace_param_reference(optimizer, old_depth_param, new_depth_param)
             scene._depth = new_depth_param
 
 

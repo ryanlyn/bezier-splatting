@@ -46,7 +46,7 @@ def _open_curve_to_path(
         x3, y3 = cp[base + 3].tolist()
         d += f" C {x1:.2f},{y1:.2f} {x2:.2f},{y2:.2f} {x3:.2f},{y3:.2f}"
 
-    color_str = _rgb_str(torch.sigmoid(color))
+    color_str = _rgb_str(color.clamp(0, 1))
     sw = 0.5 + torch.sigmoid(torch.tensor(stroke_width)).item() * 4.5
 
     return (

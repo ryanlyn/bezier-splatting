@@ -151,10 +151,10 @@ def compute_pairwise_iou(aabb: Float[Tensor, "N 4"]) -> Float[Tensor, "N N"]:
 
 
 def compute_color_distance(colors: Float[Tensor, "N 3"]) -> Float[Tensor, "N N"]:
-    """Pairwise L2 distance on sigmoid(colors).
+    """Pairwise L2 distance on already-activated RGB values.
 
     Args:
-        colors: (N, 3) pre-sigmoid color values.
+        colors: (N, 3) colors in a comparable space (typically [0, 1]).
 
     Returns:
         (N, N) distance matrix.
@@ -163,8 +163,7 @@ def compute_color_distance(colors: Float[Tensor, "N 3"]) -> Float[Tensor, "N N"]
     if N == 0:
         return torch.empty(0, 0, device=colors.device, dtype=colors.dtype)
 
-    c = torch.sigmoid(colors)  # (N, 3)
-    diff = c.unsqueeze(1) - c.unsqueeze(0)  # (N, N, 3)
+    diff = colors.unsqueeze(1) - colors.unsqueeze(0)  # (N, N, 3)
     return torch.sqrt((diff ** 2).sum(dim=-1) + 1e-12)  # (N, N)
 
 
@@ -187,7 +186,7 @@ def compute_overlap_suppression_mask(
 
     Args:
         aabb: (N, 4) bounding boxes.
-        colors: (N, 3) pre-sigmoid colors.
+        colors: (N, 3) colors in a comparable space (typically [0, 1]).
         areas: (N,) per-curve areas in pixel space.
         iou_threshold: Minimum IoU to consider a pair overlapping.
         color_threshold: Maximum color distance to consider similar.
@@ -322,9 +321,10 @@ def compute_prune_mask_open(
     else:
         overlap_area_thresh = config.area_threshold_late
 
+    open_overlap_colors = scene.open_colors.clamp(0.0, 1.0) * open_opacities
     keep_overlap = compute_overlap_suppression_mask(
         aabb,
-        scene.open_colors,
+        open_overlap_colors,
         areas,
         config.iou_threshold_open,
         config.color_threshold_open,
@@ -436,9 +436,17 @@ def compute_prune_mask_closed(
     )
 
     # 5. Overlap + color similarity suppression
+    closed_opacity_rgb = closed_op
+    if closed_opacity_rgb.ndim == 1:
+        closed_opacity_rgb = closed_opacity_rgb[:, None]
+    if closed_opacity_rgb.shape[1] == 1:
+        closed_opacity_rgb = closed_opacity_rgb.expand(-1, 3)
+    elif closed_opacity_rgb.shape[1] > 3:
+        closed_opacity_rgb = closed_opacity_rgb[:, :3]
+    closed_overlap_colors = torch.sigmoid(scene.closed_colors) * closed_opacity_rgb
     keep_overlap = compute_overlap_suppression_mask(
         aabb,
-        scene.closed_colors,
+        closed_overlap_colors,
         areas,
         config.iou_threshold_closed,
         config.color_threshold_closed,
@@ -515,7 +523,7 @@ def compute_densify_centers(
     error_map = error_map * (error_map > nodiff_threshold).float()
 
     # Grid-cell partitioning to find hotspot centers
-    cell_size = max(H, W) // 8
+    cell_size = max(1, max(H, W) // 8)
     n_cells_y = (H + cell_size - 1) // cell_size
     n_cells_x = (W + cell_size - 1) // cell_size
 

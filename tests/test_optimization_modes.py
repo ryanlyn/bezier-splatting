@@ -10,7 +10,7 @@ from bezier_splatting.losses import LossConfig
 def _patch_loss_to_capture(monkeypatch, bucket: dict):
     """Patch compute_loss to capture the effective LossConfig."""
 
-    def _fake_compute_loss(rendered, target, scene, config, step):
+    def _fake_compute_loss(rendered, target, scene, config, step, collect_loss_dict=False):
         bucket["config"] = config
         zero_loss = rendered.mean() * 0.0
         return zero_loss, {"reconstruction": 0.0, "total": 0.0}
@@ -19,7 +19,7 @@ def _patch_loss_to_capture(monkeypatch, bucket: dict):
 
 
 class TestLossPresetResolution:
-    def test_official_closed_preset_is_default(self, monkeypatch):
+    def test_closed_preset_is_default(self, monkeypatch):
         captured: dict = {}
         _patch_loss_to_capture(monkeypatch, captured)
 
@@ -83,14 +83,14 @@ class TestLossPresetResolution:
             n_closed=1,
             steps=1,
             log_every=1,
-            loss_preset="official_closed",
+            loss_preset="closed",
             loss_config=custom,
         )
         assert captured["config"] is custom
 
 
 class TestTopologyScheduleModes:
-    def test_official_alternating_runs_prune_and_densify_in_separate_phases(self, monkeypatch):
+    def test_alternating_runs_prune_and_densify_in_separate_phases(self, monkeypatch):
         calls: list[tuple[bool, bool, int | None]] = []
 
         _patch_loss_to_capture(monkeypatch, {})
@@ -125,7 +125,7 @@ class TestTopologyScheduleModes:
             steps=7,
             prune_every=2,
             prune_stop_before_end=0,
-            topology_schedule="official_alternating",
+            topology_schedule="alternating",
             topology_start_step=0,
             topology_max_step_open=100,
             log_every=1000,

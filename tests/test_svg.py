@@ -53,7 +53,7 @@ class TestOpenCurvePath:
         for i in range(10):
             cp[i, 0] = -1.0 + i * 2.0 / 9  # x: [-1, 1]
             cp[i, 1] = 0.0  # y: all zero (horizontal line)
-        color = torch.zeros(3)  # pre-sigmoid -> sigmoid(0) = 0.5
+        color = torch.zeros(3)  # open colors are clamped directly to [0, 1]
         opacity = 0.8  # post-sigmoid
         stroke_width = 0.0  # pre-sigmoid -> 0.5 + 0.5 * 4.5 = 2.75
         return cp, color, opacity, stroke_width
@@ -112,12 +112,11 @@ class TestOpenCurvePath:
         assert sw_match is not None
         assert float(sw_match.group(1)) == pytest.approx(expected_sw, abs=0.01)
 
-    def test_color_sigmoid_applied(self, open_curve_data):
-        """Color: sigmoid(pre_sigmoid) -> rgb string."""
+    def test_color_clamp_applied(self, open_curve_data):
+        """Color: clamp(raw) -> rgb string."""
         cp, color, opacity, sw = open_curve_data
         path_str = _open_curve_to_path(cp, color, opacity, sw, 64, 64)
-        # color = [0, 0, 0] -> sigmoid = [0.5, 0.5, 0.5] -> rgb(127, 127, 127)
-        assert 'stroke="rgb(127,127,127)"' in path_str
+        assert 'stroke="rgb(0,0,0)"' in path_str
 
     def test_opacity_in_output(self, open_curve_data):
         cp, color, opacity, sw = open_curve_data
@@ -292,17 +291,17 @@ class TestSceneToSvg:
         assert spread0 > spread1, "Larger curve should be drawn first (background)"
 
     def test_color_accuracy(self):
-        """SVG fill/stroke colors match sigmoid(pre_sigmoid) * 255."""
+        """Open-curve SVG colors match clamp(raw_color) * 255."""
         scene = VectorGraphicsScene(n_open=1, n_closed=0, H=64, W=64)
         with torch.no_grad():
             scene.open_colors[0] = torch.tensor([2.0, -2.0, 0.0])
             scene.open_opacities[0].fill_(2.0)  # ensure visible
         svg = scene_to_svg(scene)
 
-        # sigmoid([2, -2, 0]) -> [0.8808, 0.1192, 0.5] -> int([224, 30, 127])
-        expected_r = int(torch.sigmoid(torch.tensor(2.0)).item() * 255)
-        expected_g = int(torch.sigmoid(torch.tensor(-2.0)).item() * 255)
-        expected_b = int(torch.sigmoid(torch.tensor(0.0)).item() * 255)
+        # clamp([2, -2, 0]) -> [1, 0, 0] -> rgb(255, 0, 0)
+        expected_r = int(torch.clamp(torch.tensor(2.0), 0, 1).item() * 255)
+        expected_g = int(torch.clamp(torch.tensor(-2.0), 0, 1).item() * 255)
+        expected_b = int(torch.clamp(torch.tensor(0.0), 0, 1).item() * 255)
         expected_rgb = f"rgb({expected_r},{expected_g},{expected_b})"
         assert expected_rgb in svg
 
