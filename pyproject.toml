@@ -18,7 +18,7 @@ dependencies = [
 
 [project.scripts]
 bezier-debug = "bezier_splatting.debug.inspector:main"
-bezier-repro = "bezier_splatting.repro.cli:main"
+bezier-repro = "eval.cli:main"
 
 [project.optional-dependencies]
 cuda = [

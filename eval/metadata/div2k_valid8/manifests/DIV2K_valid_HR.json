@@ -1,0 +1,61 @@
+{
+  "dataset_name": "DIV2K_valid_HR",
+  "image_dir": "${DATASET_ROOT}",
+  "total_discovered": 100,
+  "selected_count": 8,
+  "selection": {
+    "subsample_every": 1,
+    "subsample_phase": 0,
+    "limit": 8
+  },
+  "images": [
+    {
+      "index": 0,
+      "filename": "0801.png",
+      "stem": "0801",
+      "path": "${DATASET_ROOT}/0801.png"
+    },
+    {
+      "index": 1,
+      "filename": "0802.png",
+      "stem": "0802",
+      "path": "${DATASET_ROOT}/0802.png"
+    },
+    {
+      "index": 2,
+      "filename": "0803.png",
+      "stem": "0803",
+      "path": "${DATASET_ROOT}/0803.png"
+    },
+    {
+      "index": 3,
+      "filename": "0804.png",
+      "stem": "0804",
+      "path": "${DATASET_ROOT}/0804.png"
+    },
+    {
+      "index": 4,
+      "filename": "0805.png",
+      "stem": "0805",
+      "path": "${DATASET_ROOT}/0805.png"
+    },
+    {
+      "index": 5,
+      "filename": "0806.png",
+      "stem": "0806",
+      "path": "${DATASET_ROOT}/0806.png"
+    },
+    {
+      "index": 6,
+      "filename": "0807.png",
+      "stem": "0807",
+      "path": "${DATASET_ROOT}/0807.png"
+    },
+    {
+      "index": 7,
+      "filename": "0808.png",
+      "stem": "0808",
+      "path": "${DATASET_ROOT}/0808.png"
+    }
+  ]
+}
