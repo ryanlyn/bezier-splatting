@@ -1,18 +1,33 @@
 # CLAUDE.md — Bézier Splatting
 
-Pure PyTorch reimplementation of "Bézier Splatting for Fast and Differentiable Vector Graphics Rendering" (NeurIPS 2025, arxiv 2503.16424). Educational clarity over raw speed. No CUDA kernels.
+Pure PyTorch reimplementation of "Bézier Splatting for Fast and Differentiable Vector Graphics Rendering" (NeurIPS 2025, arxiv 2503.16424). Educational clarity over raw speed, with optional CUDA acceleration via `gsplat`.
 
 ## Quick Reference
 
 ```bash
 uv run pytest tests/ -v --ignore=tests/test_reconstruction.py  # unit tests only (~7s)
 uv run pytest tests/ -v --typecheck --ignore=tests/test_reconstruction.py  # with shape checking
-uv run pytest tests/test_reconstruction.py --fast -v  # fast reconstruction (~6 min)
+uv run pytest tests/test_reconstruction.py --fast -v  # fast reconstruction (~10s CUDA, ~6 min CPU)
 uv run pytest tests/ -v                              # full suite (~25 min)
 uv run pytest tests/ --save-outputs                   # save diagnostic images to tests/outputs/
 uv run pytest tests/test_reconstruction.py -k circle  # single reconstruction target
 uv run marimo edit notebooks/vectorize.py             # interactive notebook
+uv run python -m eval.cli --help                      # eval/repro CLI
 ```
+
+## Essential Knowledge
+
+- Canonical eval/repro logic lives in `src/eval/`:
+  - `src/eval/core.py`
+  - `src/eval/cli.py`
+- Do **not** use `bezier_splatting.repro` (removed; no compatibility CLI layer).
+- Canonical artifact layout:
+  - `eval/metadata/` for manifests + metadata
+  - `eval/data/` for path-agnostic notes only (no machine-specific dataset paths)
+  - `eval/results/` for generated run outputs
+- `eval/results/` is intentionally ignored by git via `eval/results/.gitignore`; only `.gitignore` and `.gitkeep` are tracked.
+- Never commit hardcoded local paths (e.g. `/home/...`) in eval metadata/results. Use relative paths or placeholders.
+- Repro/eval unit tests are in `tests/test_eval.py`.
 
 ## Architecture
 
@@ -21,7 +36,7 @@ src/bezier_splatting/
 ├── bezier.py        # Pure Bézier math (evaluate, tangent, Bernstein basis)
 ├── coords.py        # Coordinate space conversion: [-1,1] model ↔ pixel ↔ legacy [0,1]
 ├── sampling.py      # Curve → GaussianParams conversion (open + closed samplers)
-├── rasterizer.py    # Chunked batched tile rendering for 2D Gaussian splatting (front-to-back alpha compositing)
+├── rasterizer.py    # 2D Gaussian splatting: pytorch (pure PyTorch, all devices) + gsplat (CUDA-accelerated)
 ├── model.py         # VectorGraphicsScene (nn.Module combining all primitives, learned _depth)
 ├── optimization.py  # Training loop + optimizer state surgery + pruning/densification
 ├── losses.py        # Configurable composite loss system (LossConfig + 6 loss terms)
