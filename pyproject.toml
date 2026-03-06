@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Differentiable vector graphics rendering via Bézier splatting, based on Liu et al. (2025)"
 readme = "README.md"
 authors = [
-    { name = "ryanlyn", email = "mailboxryanlin@icloud.com" }
+    { name = "Ryan Lin" }
 ]
 requires-python = ">=3.11"
 dependencies = [

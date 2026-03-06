@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this repository, please cite the original Bézier Splatting paper."
+title: "bezier-splatting"
+type: software
+authors:
+  - family-names: "Lin"
+    given-names: "Ryan"
+repository-code: "https://github.com/ryanlyn/bezier-splatting"
+license: "MIT"
+preferred-citation:
+  type: conference-paper
+  title: "Bézier Splatting for Fast and Differentiable Vector Graphics Rendering"
+  authors:
+    - family-names: "Liu"
+      given-names: "Xi"
+    - family-names: "Zhou"
+      given-names: "Chaoyi"
+    - family-names: "Zhao"
+      given-names: "Nanxuan"
+    - family-names: "Huang"
+      given-names: "Siyu"
+  year: 2025
+  url: "https://openreview.net/forum?id=bTclOYRfYJ"
