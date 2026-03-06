@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Internal notes for local agent workflows.
+Clarity-forward internal notes for local agent workflows.
 
 - Public project documentation lives in `README.md`.
 - Do not commit machine-specific dataset paths or generated eval outputs.

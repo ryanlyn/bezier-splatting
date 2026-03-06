@@ -1,8 +1,8 @@
 # bezier-splatting
 
-Unofficial educational reimplementation of [Bézier Splatting for Fast and Differentiable Vector Graphics Rendering](https://arxiv.org/abs/2503.16424).
+Replication of [Bézier Splatting for Fast and Differentiable Vector Graphics Rendering](https://arxiv.org/abs/2503.16424) for experimentation. This is not the official implementation and is not affiliated with the original authors.
 
-This repository is for learning, inspection, and experimentation. It is not the official implementation and is not affiliated with the original authors.
+Bézier Splatting represents vector graphics as Bézier curves sampled into 2D Gaussians, which makes rasterization fast, differentiable, and directly compatible with curve-based editing and SVG export. The method is interesting because it makes it practical to study higher-fidelity vectorization, optimization dynamics, pruning and densification behavior, and new questions around editable learned vector representations without treating the renderer as a black box.
 
 ## Attribution
 
@@ -51,15 +51,11 @@ The bundled sample PNGs in [samples/README.md](samples/README.md) come from the 
 - Source: [r0k.us/graphics/kodak](https://r0k.us/graphics/kodak/)
 - Included files: `kodim04.png`, `kodim07.png`, `kodim08.png`, `kodim23.png`
 
-These files are included only as small educational examples for the debug tooling and local experiments.
-
-## Notes
-
-- This repo intentionally does not vendor the upstream paper PDF or source tree.
-- Reproduction metadata should not be committed with machine-specific dataset paths.
-- If you use this repository academically, cite the original Bézier Splatting paper rather than this reimplementation.
+These files are included only as small examples for the debug tooling and local experiments.
 
 ## Citation
+
+If you use this repository, please cite the original Bézier Splatting paper:
 
 ```bibtex
 @inproceedings{
