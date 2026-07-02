@@ -14,12 +14,16 @@ from torch.optim.optimizer import Optimizer
 class Adan(Optimizer):
     r"""Adan optimizer with Nesterov-style momentum.
 
-    Update rule per parameter at step t::
+    Update rule per parameter at step t (with bias corrections
+    bc_i = 1 - (1 - b_i)^t, matching the official implementation)::
 
         m_t = (1 - b1) * m_{t-1} + b1 * g_t
         v_t = (1 - b2) * v_{t-1} + b2 * (g_t - g_{t-1})
         n_t = (1 - b3) * n_{t-1} + b3 * (g_t + (1 - b2) * (g_t - g_{t-1}))^2
-        theta_t = theta_{t-1} - lr * (m_t + (1 - b2) * v_t) / (sqrt(n_t) + eps) - wd * theta_{t-1}
+        update = (m_t / bc1 + (1 - b2) * v_t / bc2) / (sqrt(n_t / bc3) + eps)
+        theta_t = (theta_{t-1} - lr * update) / (1 + lr * wd)
+
+    Weight decay uses the proximal form from the paper.
 
     Args:
         params: Iterable of parameters or param groups.
@@ -95,11 +99,17 @@ class Adan(Optimizer):
                     state["neg_pre_grad"] = grad.neg().clone()
 
                 state["step"] += 1
+                t = state["step"]
 
                 exp_avg = state["exp_avg"]
                 exp_avg_diff = state["exp_avg_diff"]
                 exp_avg_sq = state["exp_avg_sq"]
                 neg_pre_grad = state["neg_pre_grad"]
+
+                # Bias corrections (official Adan): bc_i = 1 - (1 - b_i)^t
+                bias_correction1 = 1.0 - (1.0 - beta1) ** t
+                bias_correction2 = 1.0 - (1.0 - beta2) ** t
+                bias_correction3 = 1.0 - (1.0 - beta3) ** t
 
                 # g_t - g_{t-1} (neg_pre_grad stores -g_{t-1})
                 diff = grad + neg_pre_grad
@@ -114,14 +124,17 @@ class Adan(Optimizer):
                 update_sq = (grad + (1.0 - beta2) * diff).square()
                 exp_avg_sq.lerp_(update_sq, beta3)
 
-                # theta_t = theta_{t-1} - lr * (m_t + (1 - b2) * v_t) / (sqrt(n_t) + eps)
-                denom = exp_avg_sq.sqrt().add_(eps)
-                update = (exp_avg + (1.0 - beta2) * exp_avg_diff).div_(denom)
+                # update = (m̂_t + (1 - b2) * v̂_t) / (sqrt(n̂_t) + eps)
+                denom = (exp_avg_sq / bias_correction3).sqrt().add_(eps)
+                update = (
+                    exp_avg / bias_correction1
+                    + (1.0 - beta2) * exp_avg_diff / bias_correction2
+                ).div_(denom)
                 p.add_(update, alpha=-lr)
 
-                # Decoupled weight decay: theta_t -= wd * theta_{t-1}
+                # Proximal weight decay: theta_t = theta_t' / (1 + lr * wd)
                 if weight_decay != 0.0:
-                    p.add_(p, alpha=-weight_decay * lr)
+                    p.div_(1.0 + lr * weight_decay)
 
                 # Store -g_t for next step
                 neg_pre_grad.copy_(grad.neg())

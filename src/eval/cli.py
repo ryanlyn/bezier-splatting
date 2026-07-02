@@ -57,7 +57,7 @@ def _train_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--save-svg", action="store_true")
     parser.add_argument("--raster-backend", type=str, default="auto")
     parser.add_argument("--raster-tile-size", type=int, default=16)
-    parser.add_argument("--raster-chunk-size", type=int, default=16)
+    parser.add_argument("--raster-chunk-size", type=int, default=None)
 
 
 def _collect_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -97,7 +97,7 @@ def _speed_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--raster-backend", type=str, default="auto")
     parser.add_argument("--raster-tile-size", type=int, default=16)
-    parser.add_argument("--raster-chunk-size", type=int, default=16)
+    parser.add_argument("--raster-chunk-size", type=int, default=None)
 
 
 def _run_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -116,7 +116,7 @@ def _run_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--log-every", type=int, default=200)
     parser.add_argument("--raster-backend", type=str, default="auto")
     parser.add_argument("--raster-tile-size", type=int, default=16)
-    parser.add_argument("--raster-chunk-size", type=int, default=16)
+    parser.add_argument("--raster-chunk-size", type=int, default=None)
     parser.add_argument("--upstream-div2k", action="store_true", help="Use upstream DIV2K 1-in-4 selection")
     parser.add_argument("--subsample-every", type=int, default=1)
     parser.add_argument("--subsample-phase", type=int, default=0)

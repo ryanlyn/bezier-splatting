@@ -407,8 +407,8 @@ def rasterize(
     W: int,
     bg_color: Float[Tensor, " 3"] | None = None,
     tile_size: int = 16,
-    chunk_size: int = 16,
-    backend: RasterBackend = "mps",
+    chunk_size: int | None = None,
+    backend: RasterBackend = "pytorch",
 ) -> Float[Tensor, "3 H W"]:
     """Differentiable 2D Gaussian splatting.
 
@@ -417,7 +417,8 @@ def rasterize(
         H, W: Image height and width in pixels.
         bg_color: Background color (3,). Defaults to white.
         tile_size: Tile size in pixels.
-        chunk_size: Number of tiles processed in parallel.
+        chunk_size: Number of tiles processed in parallel (pytorch backend).
+            ``None`` (default) auto-tunes based on the workload.
         backend: ``"pytorch"`` (default), ``"auto"``, ``"gsplat"``,
                  or legacy aliases ``"mps"``/``"reference"``.
 
@@ -427,9 +428,9 @@ def rasterize(
     resolved = _resolve_backend(backend, gaussians.means.device)
 
     if resolved == "pytorch":
-        # Preserve explicit chunk override; otherwise auto-tune.
+        # Honor explicit chunk override; otherwise auto-tune.
         pytorch_chunk = chunk_size
-        if chunk_size == 16:
+        if chunk_size is None:
             pytorch_chunk = _default_pytorch_chunk_size(
                 H,
                 W,

@@ -14,6 +14,7 @@ from bezier_splatting.topology import (
     compute_prune_mask_open,
     compute_prune_mask_closed,
     compute_densify_centers,
+    compute_densify_targets,
 )
 from bezier_splatting.model import VectorGraphicsScene
 
@@ -400,3 +401,32 @@ class TestComputeColorDistance:
         colors = torch.randn(5, 3)
         cdist = compute_color_distance(colors)
         torch.testing.assert_close(cdist, cdist.T)
+
+
+class TestComputeDensifyTargets:
+    """Unified hotspot centers + aspect ratios for densification."""
+
+    def test_returns_matching_shapes(self):
+        rendered = torch.zeros(3, 64, 64)
+        target = torch.ones(3, 64, 64)
+        centers, aspects = compute_densify_targets(rendered, target, 3, 64, 64)
+        assert centers.shape[0] == aspects.shape[0]
+        assert centers.shape[0] <= 3
+        assert centers.shape[1] == 2
+        assert (aspects >= 1.0).all()
+
+    def test_elongated_error_region_high_aspect(self):
+        rendered = torch.zeros(3, 64, 64)
+        target = torch.zeros(3, 64, 64)
+        # Thin horizontal stripe of error inside the top-left cell
+        target[:, 4:6, 0:8] = 1.0
+        centers, aspects = compute_densify_targets(rendered, target, 1, 64, 64)
+        assert centers.shape[0] == 1
+        assert aspects[0].item() > 2.0
+
+    def test_zero_error_cells_dropped(self):
+        rendered = torch.zeros(3, 64, 64)
+        target = torch.zeros(3, 64, 64)
+        target[:, 0:8, 0:8] = 1.0  # only one cell has error
+        centers, aspects = compute_densify_targets(rendered, target, 5, 64, 64)
+        assert centers.shape[0] == 1

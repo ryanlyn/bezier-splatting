@@ -1,5 +1,10 @@
 # Design: Circular Curve Initialization Pattern (Sec. 4.1)
 
+> **Status: implemented.** `_make_open_curve` uses a semicircular arc and
+> `_make_closed_curve` uses upper/lower ellipse arcs with shared endpoints,
+> adapted to the current [-1, 1] coordinate convention (the snippets below
+> predate that migration and use [0, 1] coords).
+
 ## Context
 
 Per the paper (Sec. 4.1):

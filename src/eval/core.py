@@ -227,9 +227,10 @@ def train_experiment(
     steps_closed: int = PAPER_CLOSED_STEPS,
     log_every: int = 200,
     save_svg: bool = False,
+    optimizer_type: str = "adan",
     raster_backend: str = "auto",
     raster_tile_size: int = 16,
-    raster_chunk_size: int = 16,
+    raster_chunk_size: int | None = None,
 ) -> ExperimentRunSummary:
     """Train one (mode, curve_count) experiment across manifest images."""
     dataset_name = manifest["dataset_name"]
@@ -266,7 +267,7 @@ def train_experiment(
         _set_seed(seed)
         target = _to_tensor(image_path, device)
         _, height, width = target.shape
-        lr_scale = cp_lr_scale_for_resolution(height, width)
+        cp_lr_scale = cp_lr_scale_for_resolution(height, width)
 
         out_dir.mkdir(parents=True, exist_ok=True)
         t0 = time.perf_counter()
@@ -277,8 +278,10 @@ def train_experiment(
             steps=steps,
             prune_every=PAPER_PRUNE_EVERY,
             prune_stop_before_end=PAPER_PRUNE_STOP_BEFORE_END,
-            lr_scale=lr_scale,
-            optimizer_type="adam",
+            # Scale only the control-point learning rate to the paper's
+            # absolute value; other parameter groups keep their base rates.
+            cp_lr_scale=cp_lr_scale,
+            optimizer_type=optimizer_type,
             topology_schedule="alternating",
             topology_start_step=1000,
             topology_max_step_open=14_000,
@@ -313,7 +316,8 @@ def train_experiment(
             "height": height,
             "width": width,
             "training_seconds": elapsed,
-            "lr_scale": lr_scale,
+            "cp_lr_scale": cp_lr_scale,
+            "optimizer_type": optimizer_type,
             "paper_params": {
                 "cp_lr_target": PAPER_CP_LR,
                 "samples_per_open": PAPER_SAMPLES_PER_OPEN,
@@ -364,9 +368,10 @@ def train_matrix(
     steps_closed: int = PAPER_CLOSED_STEPS,
     log_every: int = 200,
     save_svg: bool = False,
+    optimizer_type: str = "adan",
     raster_backend: str = "auto",
     raster_tile_size: int = 16,
-    raster_chunk_size: int = 16,
+    raster_chunk_size: int | None = None,
 ) -> list[ExperimentRunSummary]:
     summaries: list[ExperimentRunSummary] = []
     for mode in modes:
@@ -384,6 +389,7 @@ def train_matrix(
                 steps_closed=steps_closed,
                 log_every=log_every,
                 save_svg=save_svg,
+                optimizer_type=optimizer_type,
                 raster_backend=raster_backend,
                 raster_tile_size=raster_tile_size,
                 raster_chunk_size=raster_chunk_size,
@@ -690,7 +696,7 @@ def benchmark_speed(
     iters: int = 50,
     raster_backend: str = "auto",
     raster_tile_size: int = 16,
-    raster_chunk_size: int = 16,
+    raster_chunk_size: int | None = None,
 ) -> dict:
     """Benchmark forward/backward timings for open and closed scenes."""
     from bezier_splatting.model import VectorGraphicsScene

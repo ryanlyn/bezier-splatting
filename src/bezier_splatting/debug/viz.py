@@ -63,7 +63,7 @@ def _scene_from_state(
     closed_sampling_mode: str = "cdf",
     raster_backend: str = "auto",
     raster_tile_size: int = 16,
-    raster_chunk_size: int = 16,
+    raster_chunk_size: int | None = None,
 ) -> VectorGraphicsScene:
     """Reconstruct a scene from serialized state tensors."""
     state = dict(raw_state)
@@ -178,6 +178,7 @@ def _scene_from_snapshot(snapshot: dict) -> VectorGraphicsScene:
     n_open = snapshot.get("n_open")
     n_closed = snapshot.get("n_closed")
     state = {key: val for key, val in snapshot.items() if isinstance(val, Tensor)}
+    chunk_size = snapshot.get("raster_chunk_size")
     return _scene_from_state(
         state,
         n_open=n_open,
@@ -188,7 +189,7 @@ def _scene_from_snapshot(snapshot: dict) -> VectorGraphicsScene:
         closed_sampling_mode=str(snapshot.get("closed_sampling_mode", "cdf")),
         raster_backend=str(snapshot.get("raster_backend", "auto")),
         raster_tile_size=int(snapshot.get("raster_tile_size", 16)),
-        raster_chunk_size=int(snapshot.get("raster_chunk_size", 16)),
+        raster_chunk_size=int(chunk_size) if chunk_size is not None else None,
     )
 
 
@@ -209,7 +210,11 @@ def _scene_from_checkpoint(ckpt: dict) -> VectorGraphicsScene:
         closed_sampling_mode=str(ckpt.get("closed_sampling_mode", "cdf")),
         raster_backend=str(ckpt.get("raster_backend", "auto")),
         raster_tile_size=int(ckpt.get("raster_tile_size", 16)),
-        raster_chunk_size=int(ckpt.get("raster_chunk_size", 16)),
+        raster_chunk_size=(
+            int(ckpt["raster_chunk_size"])
+            if ckpt.get("raster_chunk_size") is not None
+            else None
+        ),
     )
 
 

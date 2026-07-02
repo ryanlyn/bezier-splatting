@@ -217,3 +217,31 @@ class TestCallbackLossSyncControl:
 
         finite_steps = [step for step, loss in observed if math.isfinite(loss)]
         assert finite_steps == [0, 1, 2, 3, 4]
+
+
+class TestCpLrScaleScoping:
+    """cp_lr_scale must rescale only control-point learning rates."""
+
+    def test_cp_lr_scale_only_affects_control_points(self):
+        from bezier_splatting.model import VectorGraphicsScene
+
+        scene = VectorGraphicsScene(n_open=2, n_closed=2, H=64, W=64)
+        groups = opt_mod._build_param_groups(scene, 64, 64, lr_scale=1.0, cp_lr_scale=2.0)
+        by_name = {g["name"]: g["lr"] for g in groups}
+        assert by_name["open_cp"] == pytest.approx(0.25 / 64 * 2.0)
+        assert by_name["closed_shared_pts"] == pytest.approx(0.25 / 64 * 2.0)
+        assert by_name["closed_interior_cp"] == pytest.approx(0.25 / 64 * 2.0)
+        # Non-CP groups keep their base rates
+        assert by_name["open_colors"] == pytest.approx(0.01)
+        assert by_name["open_opacities"] == pytest.approx(0.1)
+        assert by_name["open_stroke_widths"] == pytest.approx(0.05)
+        assert by_name["closed_colors"] == pytest.approx(0.01)
+
+    def test_cp_lr_scale_defaults_to_lr_scale(self):
+        from bezier_splatting.model import VectorGraphicsScene
+
+        scene = VectorGraphicsScene(n_open=2, n_closed=0, H=64, W=64)
+        groups = opt_mod._build_param_groups(scene, 64, 64, lr_scale=3.0)
+        by_name = {g["name"]: g["lr"] for g in groups}
+        assert by_name["open_cp"] == pytest.approx(0.25 / 64 * 3.0)
+        assert by_name["open_colors"] == pytest.approx(0.03)
