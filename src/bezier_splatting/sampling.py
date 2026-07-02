@@ -117,7 +117,10 @@ def _closed_interior_weights(
         return biased[1:-1]
 
     if mode == "cdf":
-        # Official-style mode: Normal CDF over [-2, 2], no explicit endpoint rows.
+        # Official-style spacing: Normal CDF over [-2, 2]. Note that unlike
+        # the official implementation, the sampler always adds the two exact
+        # boundary curves as separate rows (0 and 1), so these weights cover
+        # strictly interior quantiles (~[0.009, 0.991]) between them.
         grid = torch.linspace(-2, 2, num_intermediate, device=device, dtype=dtype)
         return 0.5 * (1.0 + torch.erf(grid / math.sqrt(2.0) / 0.85))
 

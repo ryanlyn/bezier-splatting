@@ -8,7 +8,7 @@ import torch
 from jaxtyping import Float
 from torch import Tensor
 
-from .area import closed_curve_enclosed_area
+from .bezier import evaluate_bezier
 from .coords import model_to_pixel
 from .model import VectorGraphicsScene
 
@@ -66,13 +66,16 @@ def _closed_curve_to_path(
     """Convert a closed curve (paired boundaries in [-1,1]) to SVG filled <path>.
 
     Draws the top boundary forward, then the bottom boundary backward, and closes.
-    CPs are scaled from [-1,1] to pixel coordinates.
+    CPs are scaled from [-1,1] to pixel coordinates. Cubic boundaries (4 CPs)
+    export exactly as SVG cubics; other degrees are flattened by sampling the
+    actual curve (not the control polygon) into line segments.
     """
     bcp_px = model_to_pixel(boundary_cp.detach().cpu(), H, W)
     top_cp = bcp_px[0]  # (num_cp, 2)
     bot_cp = bcp_px[1]
 
     num_cp = top_cp.shape[0]
+    flatten_samples = 17  # per-boundary samples for non-cubic degrees
 
     # Top boundary: forward
     x0, y0 = top_cp[0].tolist()
@@ -85,8 +88,9 @@ def _closed_curve_to_path(
         x3, y3 = top_cp[3].tolist()
         d += f" C {x1:.2f},{y1:.2f} {x2:.2f},{y2:.2f} {x3:.2f},{y3:.2f}"
     else:
-        for i in range(1, num_cp):
-            x, y = top_cp[i].tolist()
+        t = torch.linspace(0, 1, flatten_samples)
+        pts = evaluate_bezier(top_cp.unsqueeze(0), t)[0]  # (S, 2)
+        for x, y in pts[1:].tolist():
             d += f" L {x:.2f},{y:.2f}"
 
     # Line to bottom boundary end
@@ -100,8 +104,9 @@ def _closed_curve_to_path(
         x3, y3 = bot_cp[0].tolist()
         d += f" C {x1:.2f},{y1:.2f} {x2:.2f},{y2:.2f} {x3:.2f},{y3:.2f}"
     else:
-        for i in range(num_cp - 2, -1, -1):
-            x, y = bot_cp[i].tolist()
+        t = torch.linspace(0, 1, flatten_samples)
+        pts = evaluate_bezier(bot_cp.unsqueeze(0), t)[0].flip(dims=[0])  # (S, 2)
+        for x, y in pts[1:].tolist():
             d += f" L {x:.2f},{y:.2f}"
 
     d += " Z"
@@ -124,9 +129,19 @@ def scene_to_svg(scene: VectorGraphicsScene, H: int | None = None, W: int | None
     H = H or scene.H
     W = W or scene.W
 
-    elements: list[tuple[float, str]] = []  # (area, svg_element)
+    elements: list[tuple[float, str]] = []  # (depth, svg_element)
 
-    # Closed curves (usually larger → background)
+    # Use the same depth heuristics as the rasterizer so the SVG layering
+    # matches the rendered image (smaller depth = rendered in front).
+    with torch.no_grad():
+        open_depths = (
+            scene._open_depth_values(H, W).squeeze(-1).cpu() if scene.n_open > 0 else None
+        )
+        closed_depths = (
+            scene._closed_depth_values(H, W).squeeze(-1).cpu() if scene.n_closed > 0 else None
+        )
+
+    # Closed curves
     if scene.n_closed > 0:
         closed_opacities = torch.sigmoid(scene.closed_opacities).detach().cpu()
         if closed_opacities.ndim == 2:
@@ -136,11 +151,8 @@ def scene_to_svg(scene: VectorGraphicsScene, H: int | None = None, W: int | None
             if opacity < 0.01:
                 continue
             bcp = scene.closed_boundary_cp[i]
-            bcp_px = model_to_pixel(bcp.detach().cpu(), H, W)
-            # True enclosed area (not bounding box)
-            area = closed_curve_enclosed_area(bcp_px.unsqueeze(0))[0].item()
             svg_elem = _closed_curve_to_path(bcp, scene.closed_colors[i], opacity, H, W)
-            elements.append((area, svg_elem))
+            elements.append((closed_depths[i].item(), svg_elem))
 
     # Open curves
     if scene.n_open > 0:
@@ -152,17 +164,13 @@ def scene_to_svg(scene: VectorGraphicsScene, H: int | None = None, W: int | None
             if opacity < 0.01:
                 continue
             cp = scene.open_control_points[i]
-            cp_px = model_to_pixel(cp.detach().cpu(), H, W)
-            edge_len = torch.norm(cp_px[1:] - cp_px[:-1], dim=-1).sum().item()
-            sw = 0.5 + torch.sigmoid(scene.open_stroke_widths[i]).item() * 4.5
-            area = edge_len * sw
             svg_elem = _open_curve_to_path(
                 cp, scene.open_colors[i], opacity, scene.open_stroke_widths[i].item(),
                 H, W,
             )
-            elements.append((area, svg_elem))
+            elements.append((open_depths[i].item(), svg_elem))
 
-    # Sort: larger area first (background), smaller on top (foreground)
+    # Painter's algorithm: larger depth first (background), smaller on top
     elements.sort(key=lambda x: x[0], reverse=True)
 
     svg_parts = [

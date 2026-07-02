@@ -401,3 +401,59 @@ class TestLossConfig:
         assert config.loss_type == "L1"
         assert config.lambda_xing == 0.5
         assert config.apply_curvature is False
+
+
+class TestCurvatureLossGate:
+    """The turning-angle gate must target sharp corners, not smooth regions."""
+
+    def test_sharp_kink_penalized_more_than_smooth_arc(self):
+        smooth = torch.tensor([
+            [
+                [[-0.5, 0.0], [-0.2, 0.3], [0.2, 0.3], [0.5, 0.0]],
+                [[-0.5, 0.0], [-0.2, -0.3], [0.2, -0.3], [0.5, 0.0]],
+            ]
+        ])
+        # Hairpin fold in the top boundary: the sampled polyline turns by
+        # ~90 degrees between adjacent samples at the fold tips
+        spiky = torch.tensor([
+            [
+                [[-0.5, 0.0], [2.0, 0.1], [-2.0, 0.1], [0.5, 0.0]],
+                [[-0.5, 0.0], [-0.2, -0.3], [0.2, -0.3], [0.5, 0.0]],
+            ]
+        ])
+        l_smooth = curvature_loss(smooth, H=256, W=256).item()
+        l_spiky = curvature_loss(spiky, H=256, W=256).item()
+        assert l_smooth == 0.0
+        assert l_spiky > 0.1
+
+    def test_smooth_arc_not_penalized(self):
+        """Gentle bends turn < 60 degrees per sample and stay unmasked."""
+        smooth = torch.tensor([
+            [
+                [[-0.5, 0.0], [-0.2, 0.3], [0.2, 0.3], [0.5, 0.0]],
+                [[-0.5, 0.0], [-0.2, -0.3], [0.2, -0.3], [0.5, 0.0]],
+            ]
+        ])
+        assert curvature_loss(smooth, H=256, W=256).item() == 0.0
+
+    def test_joint_corners_exempt(self):
+        """Sharp angles where the two boundaries meet are legitimate corners."""
+        # Lens whose boundaries meet at a sharp angle but are smooth inside
+        lens = torch.tensor([
+            [
+                [[-0.5, 0.0], [-0.2, 0.4], [0.2, 0.4], [0.5, 0.0]],
+                [[-0.5, 0.0], [-0.2, -0.4], [0.2, -0.4], [0.5, 0.0]],
+            ]
+        ])
+        assert curvature_loss(lens, H=256, W=256).item() == 0.0
+
+
+class TestXingLossNormalization:
+    def test_scale_independent_of_curve_count(self):
+        """Duplicating curves must not change the (mean) xing loss."""
+        torch.manual_seed(0)
+        bcp = torch.rand(4, 2, 4, 2) * 2 - 1
+        scene_small = VectorGraphicsScene(n_open=0, n_closed=4, H=32, W=32)
+        loss_small = xing_loss(scene_small, boundary_cp=bcp)
+        loss_big = xing_loss(scene_small, boundary_cp=bcp.repeat(3, 1, 1, 1))
+        torch.testing.assert_close(loss_small, loss_big, atol=1e-6, rtol=1e-5)

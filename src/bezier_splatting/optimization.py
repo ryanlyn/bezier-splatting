@@ -6,6 +6,7 @@ Paper-aligned pruning/densification with StepLR decay.
 All control points are stored in [-1, 1] normalized coordinates.
 """
 
+import math
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -21,7 +22,7 @@ from .losses import LossConfig, compute_loss
 from .model import VectorGraphicsScene
 from .topology import (
     PruneConfig,
-    compute_densify_centers,
+    compute_densify_targets,
     compute_prune_mask_closed,
     compute_prune_mask_open,
 )
@@ -230,6 +231,7 @@ def fit_image(
     lr_step_size: int = 5000,
     lr_gamma: float = 0.5,
     lr_scale: float = 1.0,
+    cp_lr_scale: float | None = None,
     optimizer_type: str = "adam",
     loss_preset: str = "closed",
     topology_schedule: str = "alternating",
@@ -243,7 +245,7 @@ def fit_image(
     num_intermediate: int | None = None,
     raster_backend: str = "auto",
     raster_tile_size: int = 16,
-    raster_chunk_size: int = 16,
+    raster_chunk_size: int | None = None,
     train_device: str | torch.device | None = None,
     prune_config: PruneConfig | None = None,
     loss_config: LossConfig | None = None,
@@ -300,6 +302,9 @@ def fit_image(
         lr_step_size: StepLR decay period.
         lr_gamma: StepLR multiplicative decay factor.
         lr_scale: Global multiplier applied to all base learning rates.
+        cp_lr_scale: Multiplier applied only to control-point learning rates.
+            When ``None``, ``lr_scale`` is used. Use this to hit an absolute
+            CP learning rate without also rescaling color/opacity/stroke rates.
         optimizer_type: ``"adam"`` (default) or ``"adan"``.
         prune_config: Pruning/densification heuristic thresholds. Uses
             defaults from ``PruneConfig()`` when ``None``.
@@ -481,7 +486,7 @@ def fit_image(
             compile_mode = str(torch_compile)
         compiled_forward = torch.compile(scene, mode=compile_mode)
 
-    param_groups = _build_param_groups(scene, H, W, lr_scale=lr_scale)
+    param_groups = _build_param_groups(scene, H, W, lr_scale=lr_scale, cp_lr_scale=cp_lr_scale)
     optimizer = _build_optimizer(param_groups, optimizer_type)
 
     lr_decay = 1.0  # accumulated decay factor
@@ -700,10 +705,16 @@ def fit_image(
         # Only rebuild optimizer when topology change introduced new param groups
         # (e.g. 0→n transition). State surgery handles normal prune/densify.
         if did_topology and needs_rebuild:
-            param_groups = _build_param_groups(scene, H, W, lr_scale=lr_scale)
+            param_groups = _build_param_groups(scene, H, W, lr_scale=lr_scale, cp_lr_scale=cp_lr_scale)
             optimizer = _build_optimizer(param_groups, optimizer_type)
             for group in optimizer.param_groups:
                 group["lr"] *= lr_decay
+
+        # Refresh depth heuristics after topology changes so newly added
+        # curves don't keep their placeholder depth (open-curve depths are
+        # otherwise frozen after step 10k).
+        if did_topology:
+            scene.update_depth_heuristic(H, W, update_open=True, update_closed=True)
 
     if debug:
         tracker.finish()
@@ -716,15 +727,21 @@ def fit_image(
 
 
 def _build_param_groups(
-    scene: VectorGraphicsScene, H: int, W: int, lr_scale: float = 1.0,
+    scene: VectorGraphicsScene,
+    H: int,
+    W: int,
+    lr_scale: float = 1.0,
+    cp_lr_scale: float | None = None,
 ) -> list[dict]:
     """Build optimizer parameter groups with per-type learning rates.
 
     Control points are in [-1, 1] normalized coordinates. The CP learning rate
     is scaled by resolution so the effective pixel displacement is ~0.25 px/iter
-    regardless of image size. All base LRs are multiplied by ``lr_scale``.
+    regardless of image size. All base LRs are multiplied by ``lr_scale``;
+    control-point groups use ``cp_lr_scale`` instead when it is provided, so a
+    resolution-derived CP rate doesn't leak into color/opacity/stroke rates.
     """
-    cp_lr = 0.25 / max(H, W) * lr_scale
+    cp_lr = 0.25 / max(H, W) * (lr_scale if cp_lr_scale is None else cp_lr_scale)
     groups: list[dict] = []
 
     if scene.n_open > 0:
@@ -888,10 +905,9 @@ def _prune_and_densify(
     if do_densify:
         densify_n = densify_n_override if densify_n_override is not None else total_pruned
         if densify_n > 0:
-            centers = compute_densify_centers(rendered, target, densify_n, H, W)
+            centers, aspects = compute_densify_targets(rendered, target, densify_n, H, W)
             if centers.shape[0] > 0:
-                error_map = (rendered - target).abs().mean(dim=0)  # (H, W)
-                _densify_curves(scene, error_map, target, densify_n, H, W, device, optimizer)
+                _densify_curves(scene, centers, aspects, target, H, W, device, optimizer)
 
     # Check if we transitioned from 0→n curves (new param groups needed)
     now_has_open = scene.n_open > 0
@@ -903,67 +919,30 @@ def _prune_and_densify(
 
 def _densify_curves(
     scene: VectorGraphicsScene,
-    error_map: Float[Tensor, "H W"],
+    centers: Float[Tensor, "M 2"],
+    aspects: Float[Tensor, " M"],
     target: Float[Tensor, "3 H W"],
-    n_new: int,
     H: int,
     W: int,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> None:
-    """Insert new curves at high-error regions.
+    """Insert new curves at the given error-hotspot centers.
 
-    Inserts a mix of open and closed curves based on error region shape.
-    Colors are initialized from the target image (logit-space for the model).
+    Inserts a mix of open and closed curves based on error region shape
+    (``aspects`` from :func:`compute_densify_targets`). Colors are initialized
+    from the target image (logit-space for closed curves).
 
     Args:
         scene: Scene to modify in-place.
-        error_map: Per-pixel error (H, W).
+        centers: (M, 2) pixel-space hotspot centers as (x, y).
+        aspects: (M,) aspect ratios of the high-error region per center.
         target: Target image (3, H, W) for color initialization.
-        n_new: Number of new curves to insert.
         H, W: Image dimensions.
         device: Torch device.
     """
-    if n_new <= 0:
+    if centers.shape[0] == 0:
         return
-
-    # Find error hotspots via grid cells
-    cell_size = max(1, max(H, W) // 8)
-    n_cells_y = (H + cell_size - 1) // cell_size
-    n_cells_x = (W + cell_size - 1) // cell_size
-
-    cell_errors: list[float] = []
-    cell_centers: list[tuple[float, float]] = []
-    cell_aspect: list[float] = []
-
-    for cy in range(n_cells_y):
-        for cx in range(n_cells_x):
-            y0 = cy * cell_size
-            x0 = cx * cell_size
-            y1 = min(y0 + cell_size, H)
-            x1 = min(x0 + cell_size, W)
-            err_patch = error_map[y0:y1, x0:x1]
-            cell_errors.append(err_patch.mean().item())
-            cell_centers.append(((x0 + x1) / 2.0, (y0 + y1) / 2.0))
-
-            # Aspect ratio of high-error sub-region -> determines curve type
-            if err_patch.max() > 0:
-                thresh = err_patch.max() * 0.5
-                high_err = err_patch > thresh
-                if high_err.any():
-                    ys, xs = torch.where(high_err)
-                    span_y = (ys.max() - ys.min() + 1).item()
-                    span_x = (xs.max() - xs.min() + 1).item()
-                    cell_aspect.append(max(span_x, span_y) / (min(span_x, span_y) + 1))
-                else:
-                    cell_aspect.append(1.0)
-            else:
-                cell_aspect.append(1.0)
-
-    sorted_indices = sorted(
-        range(len(cell_errors)), key=lambda i: cell_errors[i], reverse=True,
-    )
-    top_indices = sorted_indices[:n_new]
 
     closed_cp_count = scene.closed_interior_cp.shape[2] + 2
 
@@ -972,10 +951,7 @@ def _densify_curves(
     new_closed_cps: list[Tensor] = []
     new_closed_colors: list[Tensor] = []
 
-    for idx in top_indices:
-        cx_px, cy_px = cell_centers[idx]
-        aspect = cell_aspect[idx]
-
+    for (cx_px, cy_px), aspect in zip(centers.tolist(), aspects.tolist()):
         # Initialize color from target at center (logit space)
         px = int(min(max(cx_px, 0), W - 1))
         py = int(min(max(cy_px, 0), H - 1))
@@ -1103,15 +1079,22 @@ def _make_open_curve(
     color: Float[Tensor, " 3"], device: torch.device,
     out_cps: list[Tensor], out_colors: list[Tensor],
 ) -> None:
-    """Create one new open curve in [-1, 1] coords near a pixel center."""
+    """Create one new open curve in [-1, 1] coords near a pixel center.
+
+    Control points lie on a semicircular arc (LIVE-style circular pattern,
+    paper Sec. 4.1) so the initialization has no preferred direction and can
+    deform toward features on any side.
+    """
     center_px = torch.tensor([[cx_px, cy_px]], device=device)
     center_n = pixel_to_model(center_px, H, W).squeeze(0)  # (2,)
-    spread = 0.1  # doubled from 0.05 for [-1, 1] range
+    radius = 0.1  # normalized [-1, 1] units
 
-    cp = torch.zeros(10, 2, device=device)
-    t_vals = torch.linspace(-1, 1, 10, device=device)
-    cp[:, 0] = center_n[0] + t_vals * spread + torch.randn(10, device=device) * spread * 0.3
-    cp[:, 1] = center_n[1] + torch.randn(10, device=device) * spread * 0.5
+    theta = torch.linspace(-math.pi / 2, math.pi / 2, 10, device=device)
+    cp = torch.stack([
+        center_n[0] + radius * torch.cos(theta),
+        center_n[1] + radius * torch.sin(theta),
+    ], dim=-1)  # (10, 2)
+    cp = cp + torch.randn(10, 2, device=device) * radius * 0.1
     cp = cp.clamp(-1, 1)
 
     out_cps.append(cp)
@@ -1124,19 +1107,27 @@ def _make_closed_curve(
     num_cp: int, color: Float[Tensor, " 3"], device: torch.device,
     out_cps: list[Tensor], out_colors: list[Tensor],
 ) -> None:
-    """Create one new closed curve in [-1, 1] coords near a pixel center."""
+    """Create one new closed curve in [-1, 1] coords near a pixel center.
+
+    Boundaries are initialized as the upper and lower arcs of an ellipse
+    (LIVE-style circular pattern, paper Sec. 4.1), sharing endpoints at
+    theta = 0 and theta = pi.
+    """
     center_px = torch.tensor([[cx_px, cy_px]], device=device)
     center_n = pixel_to_model(center_px, H, W).squeeze(0)  # (2,)
-    size = 0.08  # doubled from 0.04 for [-1, 1] range
+    r_outer = 0.08  # normalized [-1, 1] units
+    r_inner = 0.05
 
+    theta = torch.linspace(0, math.pi, num_cp, device=device)
     bcp = torch.zeros(2, num_cp, 2, device=device)
-    t = torch.linspace(0, 1, num_cp, device=device)
-    for b in range(2):
-        y_off = size * (1 if b == 0 else -1)
-        bcp[b, :, 0] = center_n[0] + (t - 0.5) * size * 2
-        bcp[b, :, 1] = center_n[1] + y_off + torch.randn(num_cp, device=device) * size * 0.3
+    # Boundary 0: top arc (outer radius); boundary 1: bottom arc (inner radius)
+    bcp[0, :, 0] = center_n[0] + r_outer * torch.cos(theta)
+    bcp[0, :, 1] = center_n[1] + r_outer * torch.sin(theta)
+    bcp[1, :, 0] = center_n[0] + r_inner * torch.cos(theta)
+    bcp[1, :, 1] = center_n[1] - r_inner * torch.sin(theta)
 
-    # Shared endpoints
+    # Small noise on interior CPs only, then enforce shared endpoints exactly
+    bcp[:, 1:-1] = bcp[:, 1:-1] + torch.randn(2, num_cp - 2, 2, device=device) * r_outer * 0.1
     shared_start = (bcp[0, 0] + bcp[1, 0]) / 2
     shared_end = (bcp[0, -1] + bcp[1, -1]) / 2
     bcp[0, 0] = shared_start

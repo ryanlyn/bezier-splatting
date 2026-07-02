@@ -34,9 +34,9 @@ class VectorGraphicsScene(nn.Module):
         samples_per_closed_curve: int = 15,
         num_intermediate: int = 20,
         closed_sampling_mode: str = "cdf",
-        raster_backend: RasterBackend = "mps",
+        raster_backend: RasterBackend = "pytorch",
         raster_tile_size: int = 16,
-        raster_chunk_size: int = 16,
+        raster_chunk_size: int | None = None,
     ):
         super().__init__()
         self.H = H
@@ -154,19 +154,49 @@ class VectorGraphicsScene(nn.Module):
 
     @property
     def get_depth(self) -> Float[Tensor, "N 1"]:
-        """Apply sigmoid to depth parameter. Returns values in [0, 1]."""
-        return torch.sigmoid(self._depth)
+        """Per-curve depth values used for sorting (smaller = rendered in front).
+
+        Values are heuristic image-coverage fractions written by
+        ``update_depth_heuristic()`` — approximately (curve footprint) / (H*W)
+        for both curve types, so open and closed curves sort on a common scale.
+        """
+        return self._depth
+
+    def _open_depth_values(self, H: int, W: int) -> Float[Tensor, "N 1"]:
+        """Open-curve depth heuristic: polyline length * stroke width / (H*W)."""
+        cp_px = model_to_pixel(self.open_control_points, H, W)
+        diffs = cp_px[:, 1:] - cp_px[:, :-1]
+        lengths = torch.sqrt((diffs ** 2).sum(-1) + 1e-12).sum(-1, keepdim=True)
+        sw = 0.5 + torch.sigmoid(self.open_stroke_widths).unsqueeze(-1) * 4.5
+        return lengths * sw / float(H * W)
+
+    def _closed_depth_values(self, H: int, W: int) -> Float[Tensor, "N 1"]:
+        """Closed-curve depth heuristic: AABB pixel area / (H*W)."""
+        bcp = self._assemble_boundary_cp()
+        all_pts = bcp.reshape(self.n_closed, -1, 2)  # (N_closed, 2*CP, 2)
+        x_min = all_pts[..., 0].min(dim=-1).values
+        x_max = all_pts[..., 0].max(dim=-1).values
+        y_min = all_pts[..., 1].min(dim=-1).values
+        y_max = all_pts[..., 1].max(dim=-1).values
+        widths = (x_max - x_min) * (0.5 * W)
+        heights = (y_max - y_min) * (0.5 * H)
+        return (widths * heights / float(H * W)).unsqueeze(-1)
 
     def update_depth_heuristic(
         self, H: int, W: int, *, update_open: bool = True, update_closed: bool = True,
     ) -> None:
         """Overwrite depth parameter with geometric heuristics.
 
+        Both heuristics are normalized by the image area (H*W) so open and
+        closed curves share one comparable scale — a fraction of the image the
+        curve roughly covers. Smaller values sort to the front.
+
         Called from the training loop on a schedule. The caller controls which
         curve types to update via keyword flags:
-        - Closed curves: AABB area (typically every forward pass)
-        - Open curves: polyline length * stroke width (typically every 20 steps
-          for the first 10k iterations, then frozen)
+        - Closed curves: AABB area fraction (typically every forward pass)
+        - Open curves: polyline length * stroke width / (H*W) (typically every
+          20 steps for the first 10k iterations, then frozen; also refreshed
+          right after topology changes)
 
         This is separated from ``get_gaussians()`` so that torch.compile can
         trace the forward path without recompilation from iteration guards.
@@ -174,30 +204,15 @@ class VectorGraphicsScene(nn.Module):
         n_open = self.n_open
         n_closed = self.n_closed
 
-        # Closed curves: overwrite with AABB area
+        # Closed curves: overwrite with normalized AABB area
         if update_closed and n_closed > 0:
-            bcp = self._assemble_boundary_cp()
             with torch.no_grad():
-                all_pts = bcp.reshape(n_closed, -1, 2)  # (N_closed, 2*CP, 2)
-                x_min = all_pts[..., 0].min(dim=-1).values
-                x_max = all_pts[..., 0].max(dim=-1).values
-                y_min = all_pts[..., 1].min(dim=-1).values
-                y_max = all_pts[..., 1].max(dim=-1).values
-                ratio = W / H
-                widths = (x_max - x_min) * ratio
-                heights = y_max - y_min
-                closed_depth = widths * heights
-                self._depth.data[n_open:] = closed_depth.unsqueeze(-1)
+                self._depth.data[n_open:] = self._closed_depth_values(H, W)
 
-        # Open curves: overwrite with polyline length * stroke width
+        # Open curves: overwrite with normalized polyline length * stroke width
         if update_open and n_open > 0:
             with torch.no_grad():
-                cp_px = model_to_pixel(self.open_control_points, H, W)
-                diffs = cp_px[:, 1:] - cp_px[:, :-1]
-                lengths = torch.sqrt((diffs ** 2).sum(-1) + 1e-12).sum(-1, keepdim=True)
-                sw = 0.5 + torch.sigmoid(self.open_stroke_widths).unsqueeze(-1) * 4.5
-                open_depth = lengths * sw
-                self._depth.data[:n_open] = open_depth
+                self._depth.data[:n_open] = self._open_depth_values(H, W)
 
     def get_gaussians(self, H: int, W: int) -> GaussianParams | None:
         """Assemble and depth-sort all Gaussians without rasterizing.
@@ -218,9 +233,14 @@ class VectorGraphicsScene(nn.Module):
 
         # ── Sample from open curves ──
         if n_open > 0:
+            # Straight-through clamp: forward pass renders clamped colors, but
+            # gradients pass through unclamped so out-of-range parameters keep
+            # receiving a restoring signal instead of going dead.
+            oc = self.open_colors
+            open_colors_st = oc + (oc.clamp(0.0, 1.0) - oc).detach()
             open_g = self.open_sampler(
                 self.open_control_points,
-                self.open_colors.clamp(0.0, 1.0),
+                open_colors_st,
                 self.open_opacities,
                 self.open_stroke_widths,
                 H, W,
@@ -255,8 +275,8 @@ class VectorGraphicsScene(nn.Module):
             combined = combined.concat(g)
 
         # ── Depth-based sorting ──
-        # Open depth is always detached; closed depth passes through sigmoid
-        depth_values = self.get_depth  # (total_curves, 1) in [0, 1]
+        # Depth values are heuristic coverage fractions (smaller = front)
+        depth_values = self.get_depth  # (total_curves, 1)
 
         # Build per-Gaussian depth
         depth_parts: list[Tensor] = []
@@ -282,7 +302,8 @@ class VectorGraphicsScene(nn.Module):
             depth_parts.append(closed_depth_per_curve.reshape(-1))
 
         all_depths = torch.cat(depth_parts, dim=0)
-        sort_indices = torch.argsort(all_depths, descending=False)
+        # Stable sort so tied depths keep a deterministic (insertion) order
+        sort_indices = torch.argsort(all_depths, descending=False, stable=True)
 
         # ── Fused sort: pack all differentiable fields into one tensor ──
         # means(2) + scales(2) + rotations(1) + colors(3) + opacities(1) = 9

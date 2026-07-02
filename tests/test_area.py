@@ -162,3 +162,36 @@ class TestIntegration:
         with torch.no_grad():
             output = scene()
         assert output.shape == (3, 64, 64)
+
+
+class TestExactness:
+    """The Green's-theorem area should match a dense polygon reference."""
+
+    def test_matches_dense_shoelace_for_cubic(self):
+        from bezier_splatting.bezier import evaluate_bezier
+
+        # Bulgy cubic top boundary + straight bottom chord
+        bcp = torch.tensor([
+            [
+                [[-1.0, 0.0], [-1.0, 1.5], [1.0, 1.5], [1.0, 0.0]],
+                [[-1.0, 0.0], [-0.3, 0.0], [0.3, 0.0], [1.0, 0.0]],
+            ]
+        ])
+        area = closed_curve_enclosed_area(bcp)[0].item()
+
+        # Reference: dense sampling + shoelace formula
+        t = torch.linspace(0, 1, 4001)
+        top = evaluate_bezier(bcp[:, 0], t)[0]
+        bot = evaluate_bezier(bcp[:, 1], t)[0].flip(dims=[0])
+        poly = torch.cat([top, bot])
+        x, y = poly[:, 0], poly[:, 1]
+        ref = 0.5 * torch.abs((x * y.roll(-1) - y * x.roll(-1)).sum()).item()
+
+        assert abs(area - ref) < 1e-3
+
+    def test_quadratic_signed_area(self):
+        """Quadratic y = 2t(1-t)-style arch over [0, 1]: exact area = 1/3."""
+        # Quadratic with CPs (0,0), (0.5,1), (1,0): y(t)=2t(1-t), x(t)=t
+        cp = torch.tensor([[[0.0, 0.0], [0.5, 1.0], [1.0, 0.0]]])
+        area = bezier_signed_area(cp)[0].item()
+        assert abs(area - (1.0 / 3.0)) < 1e-5

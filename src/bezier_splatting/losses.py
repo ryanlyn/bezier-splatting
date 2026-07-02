@@ -151,9 +151,12 @@ def curvature_loss(
 ) -> Float[Tensor, ""]:
     """Penalize high curvature in closed curve boundaries.
 
-    For each closed curve, samples points along both boundaries, concatenates
-    them (second boundary flipped) to form a closed loop, then penalizes
-    second-order finite differences where the angle is below 60 degrees.
+    For each closed curve, samples points along both boundaries and penalizes
+    second-order finite differences at interior vertices where the polyline
+    direction turns by more than 60 degrees — i.e. sharp corners and kinks.
+    Smooth regions (small turning angle) are not penalized. The shared
+    endpoints where the two boundaries meet are deliberately exempt: a
+    lens-shaped fill legitimately has corners at its joints.
 
     Args:
         boundary_cp: (N, 2, CP, 2) boundary control points in [-1, 1].
@@ -175,40 +178,34 @@ def curvature_loss(
     basis = _cached_bernstein_basis(degree, samples_per_boundary, boundary_cp)  # (K, CP)
     cp_flat = boundary_cp.reshape(n * 2, num_cp, 2)  # (2N, CP, 2)
     pts = torch.einsum("sd,ndx->nsx", basis, cp_flat).reshape(n, 2, samples_per_boundary, 2)
-    b0_pts = pts[:, 0]  # (N, K, 2)
-    b1_pts = pts[:, 1]  # (N, K, 2)
 
     # Scale to pixel space for meaningful curvature magnitudes
-    b0_pts = (b0_pts + 1) / 2
-    b1_pts = (b1_pts + 1) / 2
-    b0_pts[..., 0] = b0_pts[..., 0] * W
-    b0_pts[..., 1] = b0_pts[..., 1] * H
-    b1_pts[..., 0] = b1_pts[..., 0] * W
-    b1_pts[..., 1] = b1_pts[..., 1] * H
+    scale = torch.tensor([W, H], device=pts.device, dtype=pts.dtype)
+    pts_px = (pts + 1) / 2 * scale  # (N, 2, K, 2)
 
-    # Concatenate: boundary 0 forward, boundary 1 reversed (closed loop)
-    loop_pts = torch.cat([b0_pts, b1_pts.flip(dims=[1])], dim=1)  # (N, 2K, 2)
+    # Second-order finite differences per boundary: prev - 2*curr + next.
+    # Differences run along the sample dimension, so the boundary joints never
+    # pair with samples from the other boundary.
+    prev = pts_px[:, :, :-2, :]  # (N, 2, K-2, 2)
+    curr = pts_px[:, :, 1:-1, :]
+    nxt = pts_px[:, :, 2:, :]
+    second_diff = prev - 2 * curr + nxt  # (N, 2, K-2, 2)
 
-    # Second-order finite differences: prev - 2*curr + next
-    prev = loop_pts[:, :-2, :]  # (N, 2K-2, 2)
-    curr = loop_pts[:, 1:-1, :]
-    nxt = loop_pts[:, 2:, :]
-    second_diff = prev - 2 * curr + nxt  # (N, 2K-2, 2)
+    curvature_mag = second_diff.pow(2).sum(dim=-1)  # (N, 2, K-2)
 
-    curvature_mag = second_diff.pow(2).sum(dim=-1)  # (N, 2K-2)
-
-    # Angle threshold mask at 60 degrees: only penalize where angle < 60
-    # Compute angle at each interior point from the two adjacent edges
-    edge_a = curr - prev  # (N, 2K-2, 2)
-    edge_b = nxt - curr   # (N, 2K-2, 2)
-    dot_ab = (edge_a * edge_b).sum(dim=-1)  # (N, 2K-2)
+    # Turning-angle gate: only penalize sharp vertices. The turning angle is
+    # the angle between consecutive edge directions — near 0 on smooth curves,
+    # large at corners/kinks.
+    edge_a = curr - prev  # (N, 2, K-2, 2)
+    edge_b = nxt - curr   # (N, 2, K-2, 2)
+    dot_ab = (edge_a * edge_b).sum(dim=-1)  # (N, 2, K-2)
     norm_a = torch.sqrt(edge_a.pow(2).sum(dim=-1) + 1e-12)
     norm_b = torch.sqrt(edge_b.pow(2).sum(dim=-1) + 1e-12)
     cos_angle = dot_ab / (norm_a * norm_b)
     cos_angle = cos_angle.clamp(-1, 1)
 
-    # angle < 60 degrees means cos(angle) > cos(60) = 0.5
-    angle_mask = (cos_angle > 0.5).float()
+    # Turning angle > 60 degrees means cos(turn) < cos(60) = 0.5
+    angle_mask = (cos_angle < 0.5).float()
 
     masked = curvature_mag * angle_mask
     return masked.mean()
@@ -334,7 +331,9 @@ def xing_loss(
         device = next(scene.parameters()).device
         return torch.zeros((), device=device)
 
-    return torch.cat(losses).sum()
+    # Mean over (curve, window) pairs so the loss scale is independent of the
+    # number of curves — keeps lambda_xing tuning stable across topologies.
+    return torch.cat(losses).mean()
 
 
 # ── Main Entry Point ─────────────────────────────────────────────────────

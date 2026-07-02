@@ -344,33 +344,60 @@ def compute_prune_mask_open(
     # Combined mask
     keep_mask = keep_outside & keep_opacity & keep_tiny & keep_overlap
 
-    # Build per-curve metrics
-    iou_matrix = compute_pairwise_iou(aabb)
-    max_iou = iou_matrix.max(dim=-1).values if N > 0 else torch.zeros(0, device=device)
+    metrics = _build_prune_metrics(
+        aabb, outside, max_opacity, areas,
+        keep_mask, keep_outside, keep_opacity, keep_tiny, keep_overlap,
+    )
+
+    return keep_mask, metrics
+
+
+def _build_prune_metrics(
+    aabb: Tensor,
+    outside: Tensor,
+    opacity: Tensor,
+    areas: Tensor,
+    keep_mask: Tensor,
+    keep_outside: Tensor,
+    keep_opacity: Tensor,
+    keep_tiny: Tensor,
+    keep_overlap: Tensor,
+) -> list[dict]:
+    """Assemble per-curve diagnostic dicts with a single host sync per tensor."""
+    max_iou = compute_pairwise_iou(aabb).max(dim=-1).values if aabb.shape[0] > 0 else aabb.new_zeros(0)
+
+    outside_l = outside.tolist()
+    max_iou_l = max_iou.tolist()
+    opacity_l = opacity.tolist()
+    areas_l = areas.tolist()
+    keep_l = keep_mask.tolist()
+    ko_l = keep_outside.tolist()
+    kop_l = keep_opacity.tolist()
+    kt_l = keep_tiny.tolist()
+    kov_l = keep_overlap.tolist()
 
     metrics: list[dict] = []
-    for i in range(N):
-        pruned = not keep_mask[i].item()
+    for i in range(len(keep_l)):
+        pruned = not keep_l[i]
         reason = ""
         if pruned:
-            if not keep_outside[i].item():
+            if not ko_l[i]:
                 reason = "outside_image"
-            elif not keep_opacity[i].item():
+            elif not kop_l[i]:
                 reason = "low_opacity"
-            elif not keep_tiny[i].item():
+            elif not kt_l[i]:
                 reason = "tiny_curve"
-            elif not keep_overlap[i].item():
+            elif not kov_l[i]:
                 reason = "overlap_suppressed"
         metrics.append({
-            "outside_ratio": outside[i].item(),
-            "max_iou": max_iou[i].item(),
-            "opacity": max_opacity[i].item(),
-            "area": areas[i].item(),
+            "outside_ratio": outside_l[i],
+            "max_iou": max_iou_l[i],
+            "opacity": opacity_l[i],
+            "area": areas_l[i],
             "pruned": pruned,
             "reason": reason,
         })
-
-    return keep_mask, metrics
+    return metrics
 
 
 def compute_prune_mask_closed(
@@ -466,36 +493,96 @@ def compute_prune_mask_closed(
     # Combined mask
     keep_mask = keep_outside & keep_opacity & keep_tiny & keep_overlap
 
-    # Build per-curve metrics
-    iou_matrix = compute_pairwise_iou(aabb)
-    max_iou = iou_matrix.max(dim=-1).values if N > 0 else torch.zeros(0, device=device)
-
-    metrics: list[dict] = []
-    for i in range(N):
-        pruned = not keep_mask[i].item()
-        reason = ""
-        if pruned:
-            if not keep_outside[i].item():
-                reason = "outside_image"
-            elif not keep_opacity[i].item():
-                reason = "low_opacity"
-            elif not keep_tiny[i].item():
-                reason = "tiny_curve"
-            elif not keep_overlap[i].item():
-                reason = "overlap_suppressed"
-        metrics.append({
-            "outside_ratio": outside[i].item(),
-            "max_iou": max_iou[i].item(),
-            "opacity": closed_opacity_strength[i].item(),
-            "area": areas[i].item(),
-            "pruned": pruned,
-            "reason": reason,
-        })
+    metrics = _build_prune_metrics(
+        aabb, outside, closed_opacity_strength, areas,
+        keep_mask, keep_outside, keep_opacity, keep_tiny, keep_overlap,
+    )
 
     return keep_mask, metrics
 
 
 # ── Densification ────────────────────────────────────────────────────────
+
+
+def compute_densify_targets(
+    rendered: Float[Tensor, "3 H W"],
+    target: Float[Tensor, "3 H W"],
+    n_new: int,
+    H: int,
+    W: int,
+    nodiff_threshold: float = 0.05,
+) -> tuple[Float[Tensor, "M 2"], Float[Tensor, " M"]]:
+    """Find error-hotspot centers and shapes for curve densification.
+
+    Computes per-pixel squared error, zeros out low-error regions, then finds
+    the top ``n_new`` hotspot cells via grid partitioning. Cells with zero
+    remaining error are dropped. For each selected cell, an aspect ratio of
+    its high-error sub-region is computed so the caller can pick a curve type
+    (elongated regions suit open strokes, blob-like regions suit closed fills).
+
+    Args:
+        rendered: (3, H, W) rendered image.
+        target: (3, H, W) target image.
+        n_new: Number of new curve centers to find.
+        H, W: Image dimensions.
+        nodiff_threshold: Zero errors below this squared-error threshold.
+
+    Returns:
+        Tuple of:
+            - (M, 2) pixel-space centers as (x, y), where M <= n_new.
+            - (M,) aspect ratios (>= 1) of the high-error sub-region per cell.
+    """
+    device = rendered.device
+    if n_new <= 0:
+        return torch.empty(0, 2, device=device), torch.empty(0, device=device)
+
+    # Per-pixel error: sum across channels, zeroing low-error regions
+    error_map = ((rendered - target) ** 2).sum(dim=0)  # (H, W)
+    error_map = error_map * (error_map > nodiff_threshold).float()
+
+    # Grid-cell partitioning (vectorized cell means via zero padding)
+    cell_size = max(1, max(H, W) // 8)
+    n_cells_y = (H + cell_size - 1) // cell_size
+    n_cells_x = (W + cell_size - 1) // cell_size
+
+    padded = torch.nn.functional.pad(
+        error_map, (0, n_cells_x * cell_size - W, 0, n_cells_y * cell_size - H),
+    )
+    cell_sums = padded.view(n_cells_y, cell_size, n_cells_x, cell_size).sum(dim=(1, 3))
+    heights = torch.full((n_cells_y,), cell_size, device=device, dtype=error_map.dtype)
+    heights[-1] = H - cell_size * (n_cells_y - 1)
+    widths = torch.full((n_cells_x,), cell_size, device=device, dtype=error_map.dtype)
+    widths[-1] = W - cell_size * (n_cells_x - 1)
+    cell_means = cell_sums / (heights[:, None] * widths[None, :])
+
+    flat_means = cell_means.reshape(-1)
+    k = min(n_new, flat_means.numel())
+    top_vals, top_idx = torch.topk(flat_means, k)
+    top_idx = top_idx[top_vals > 0]  # drop cells with no residual error
+
+    centers: list[tuple[float, float]] = []
+    aspects: list[float] = []
+    for idx in top_idx.tolist():
+        cy, cx = divmod(idx, n_cells_x)
+        y0, x0 = cy * cell_size, cx * cell_size
+        y1, x1 = min(y0 + cell_size, H), min(x0 + cell_size, W)
+        centers.append(((x0 + x1) / 2.0, (y0 + y1) / 2.0))
+
+        # Aspect ratio of the high-error sub-region within the cell
+        err_patch = error_map[y0:y1, x0:x1]
+        patch_max = err_patch.max()
+        high_err = err_patch > patch_max * 0.5
+        ys, xs = torch.where(high_err)
+        if ys.numel() > 0:
+            span_y = (ys.max() - ys.min() + 1).item()
+            span_x = (xs.max() - xs.min() + 1).item()
+            aspects.append(max(span_x, span_y) / max(1, min(span_x, span_y)))
+        else:
+            aspects.append(1.0)
+
+    centers_t = torch.tensor(centers, device=device, dtype=torch.float32).reshape(-1, 2)
+    aspects_t = torch.tensor(aspects, device=device, dtype=torch.float32)
+    return centers_t, aspects_t
 
 
 def compute_densify_centers(
@@ -508,55 +595,11 @@ def compute_densify_centers(
 ) -> Float[Tensor, "M 2"]:
     """Find error-hotspot centers for curve densification.
 
-    Computes per-pixel squared error, zeros out low-error regions, then
-    finds the top ``n_new`` hotspot centers via grid-cell partitioning.
-
-    Args:
-        rendered: (3, H, W) rendered image.
-        target: (3, H, W) target image.
-        n_new: Number of new curve centers to find.
-        H, W: Image dimensions.
-        nodiff_threshold: Zero errors below this squared-error threshold.
+    Thin wrapper around :func:`compute_densify_targets` that returns only the
+    centers.
 
     Returns:
         (M, 2) pixel-space centers as (x, y), where M <= n_new.
     """
-    device = rendered.device
-    if n_new <= 0:
-        return torch.empty(0, 2, device=device)
-
-    # Per-pixel error: sum across channels
-    error_map = ((rendered - target) ** 2).sum(dim=0)  # (H, W)
-
-    # Zero out low-error regions
-    error_map = error_map * (error_map > nodiff_threshold).float()
-
-    # Grid-cell partitioning to find hotspot centers
-    cell_size = max(1, max(H, W) // 8)
-    n_cells_y = (H + cell_size - 1) // cell_size
-    n_cells_x = (W + cell_size - 1) // cell_size
-
-    cell_errors: list[float] = []
-    cell_centers: list[tuple[float, float]] = []
-
-    for cy in range(n_cells_y):
-        for cx in range(n_cells_x):
-            y0 = cy * cell_size
-            x0 = cx * cell_size
-            y1 = min(y0 + cell_size, H)
-            x1 = min(x0 + cell_size, W)
-            err_patch = error_map[y0:y1, x0:x1]
-            cell_errors.append(err_patch.mean().item())
-            cell_centers.append(((x0 + x1) / 2.0, (y0 + y1) / 2.0))
-
-    sorted_indices = sorted(
-        range(len(cell_errors)), key=lambda i: cell_errors[i], reverse=True,
-    )
-    top_indices = sorted_indices[:n_new]
-
-    centers = torch.tensor(
-        [cell_centers[i] for i in top_indices],
-        device=device,
-        dtype=torch.float32,
-    )
-    return centers  # (M, 2) — pixel-space (x, y)
+    centers, _ = compute_densify_targets(rendered, target, n_new, H, W, nodiff_threshold)
+    return centers
